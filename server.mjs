@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import express from 'express';
-import { generateText, Output, stepCountIs, tool } from 'ai';
+import { generateText, stepCountIs, tool } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGroq } from '@ai-sdk/groq';
 import { createMCPClient } from '@ai-sdk/mcp';
@@ -114,20 +114,28 @@ async function composeEmailDraft(transcript, messages) {
   const result = await generateText({
     model: groq(process.env.GROQ_FAST_MODEL || 'openai/gpt-oss-20b'),
     system: `You prepare polished email drafts for the user. Infer details from recent conversation when they are clear.
-Never invent an email address. If the recipient or essential purpose is genuinely unclear, put one short friendly question in clarification.
-Otherwise return the intended recipient exactly as supplied, a useful subject, and a natural email body. Do not send or create anything.`,
+Never invent an email address. If the recipient or essential purpose is genuinely unclear, ask one short friendly question.
+Do not send or create anything.
+Return only these tags, with no JSON, Markdown, explanation, or extra tags:
+<recipient>the intended recipient exactly as supplied</recipient>
+<subject>a useful subject</subject>
+<body>the complete natural email body</body>
+<clarification>leave empty when the draft is ready; otherwise put the one necessary question here</clarification>`,
     messages: conversation,
-    output: Output.object({ schema: z.object({
-      recipient: z.string(),
-      subject: z.string(),
-      body: z.string(),
-      clarification: z.string()
-    }) }),
     maxOutputTokens: 700,
     abortSignal: AbortSignal.timeout(20_000)
   });
-  const draft = result.output;
-  if (draft.clarification.trim()) return { message: draft.clarification.trim() };
+  const field = (name) => result.text.match(new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`, 'i'))?.[1]?.trim() || '';
+  const draft = {
+    recipient: field('recipient'),
+    subject: field('subject'),
+    body: field('body'),
+    clarification: field('clarification')
+  };
+  if (draft.clarification) return { message: draft.clarification };
+  if (!draft.recipient || !draft.subject || !draft.body) {
+    throw new Error('Buddy could not read the generated email draft. Please try that request again.');
+  }
   return {
     message: 'I’ve written that. You can ask me to show it, change it, or create the Gmail draft.',
     draft: {
