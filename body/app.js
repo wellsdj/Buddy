@@ -18,6 +18,7 @@ const wakePattern = /\b(?:hey|hi|hay)\s+(?:buddy|buddey|buddie|body)\b[,.]?\s*/i
 let imageIndex = 0, busy = false, awake = false, voiceEnabled = true, speaking = false;
 let audioContext, micAnalyser, micStream, activeAnalyser, ringFrame, mediaRecorder;
 let voiceMonitorFrame, speechStartedAt = 0, silenceStartedAt = 0, transcribing = false, recordingStopping = false;
+let voiceColorPhase = 0;
 const conversationStorageKey = 'buddy-conversation-v1';
 let conversation = [];
 try {
@@ -59,34 +60,39 @@ function drawVoiceRing(time = 0) {
   const bins = new Uint8Array(activeAnalyser?.frequencyBinCount || 64);
   if (activeAnalyser) activeAnalyser.getByteFrequencyData(bins);
   const center = size / 2;
-  const baseRadius = center - 12;
-  const segments = 150;
-  const idlePulse = .16 + Math.sin(time / 420) * .05;
+  const baseRadius = center - 10;
+  const averageEnergy = bins.reduce((sum, value) => sum + value, 0) / Math.max(1, bins.length) / 255;
+  const weightedEnergy = bins.reduce((sum, value, index) => sum + value * index, 0);
+  const spectralPosition = weightedEnergy
+    ? weightedEnergy / bins.reduce((sum, value) => sum + value, 0) / bins.length
+    : .5;
+  voiceColorPhase += .0025 + averageEnergy * .055 + spectralPosition * .004;
   ringContext.lineCap = 'round';
 
-  ringContext.save();
-  ringContext.beginPath();
-  ringContext.arc(center, center, baseRadius, 0, Math.PI * 2);
-  ringContext.strokeStyle = 'rgba(255,255,255,.26)';
-  ringContext.shadowColor = 'rgba(170,225,255,.75)';
-  ringContext.shadowBlur = 18;
-  ringContext.lineWidth = 2.2;
-  ringContext.stroke();
-  ringContext.restore();
+  const gradient = ringContext.createConicGradient(voiceColorPhase, center, center);
+  gradient.addColorStop(0, '#ff7f8f');
+  gradient.addColorStop(.18, '#ffc0cb');
+  gradient.addColorStop(.37, '#d6b7ff');
+  gradient.addColorStop(.58, '#85cfff');
+  gradient.addColorStop(.76, '#7898ff');
+  gradient.addColorStop(.9, '#e59cdb');
+  gradient.addColorStop(1, '#ff7f8f');
 
-  for (let index = 0; index < segments; index++) {
-    const angle = (index / segments) * Math.PI * 2 - Math.PI / 2;
-    const nextAngle = angle + (Math.PI * 2 / segments) * .72;
-    const bin = bins[Math.floor((index / segments) * bins.length)] || 0;
-    const energy = Math.max(idlePulse, Math.pow(bin / 255, .72));
-    const hue = 188 + (index / segments) * 42;
+  for (const layer of [
+    { width: 18, alpha: .16, blur: 28 },
+    { width: 9, alpha: .34, blur: 18 },
+    { width: 4.5, alpha: .96, blur: 10 }
+  ]) {
+    ringContext.save();
     ringContext.beginPath();
-    ringContext.arc(center, center, baseRadius - energy * 3.5, angle, nextAngle);
-    ringContext.strokeStyle = `hsla(${hue}, 96%, ${72 + energy * 20}%, ${.42 + energy * .58})`;
-    ringContext.shadowColor = `hsla(${hue}, 100%, 72%, .95)`;
-    ringContext.shadowBlur = 8 + energy * 23;
-    ringContext.lineWidth = 2.4 + energy * 7;
+    ringContext.arc(center, center, baseRadius, 0, Math.PI * 2);
+    ringContext.globalAlpha = layer.alpha + averageEnergy * .08;
+    ringContext.strokeStyle = gradient;
+    ringContext.shadowColor = spectralPosition > .5 ? '#809fff' : '#ff8fa3';
+    ringContext.shadowBlur = layer.blur;
+    ringContext.lineWidth = layer.width;
     ringContext.stroke();
+    ringContext.restore();
   }
   ringFrame = requestAnimationFrame(drawVoiceRing);
 }
