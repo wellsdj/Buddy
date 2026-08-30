@@ -17,8 +17,8 @@ const app = express();
 const anthropic = createAnthropic();
 const groq = createGroq();
 const runFile = promisify(execFile);
-let composioSession;
-let composioMcpClient;
+const composioSessions = new Map();
+const composioMcpClients = new Map();
 let pendingMessage;
 let buddyRequestId = 0;
 const mockReplies = [
@@ -30,10 +30,10 @@ const mockReplies = [
 ];
 const buddySystemPrompt = `You are Buddy, a warm, concise desk companion with Gmail, Spotify, GitHub, and Vercel tools.
 Use tools only when the user asks for an action or current account information.
-When tools are needed, call COMPOSIO_SEARCH_TOOLS immediately without a spoken preamble,
-then execute the selected tool and report only the confirmed result.
+When tools are needed, call the relevant app tool immediately without a spoken preamble and report only the confirmed result.
 Never claim an action succeeded unless its tool result confirms it.
 For email, create a draft by default; only send when the user clearly says to send.
+Apple Messages is available only when Buddy is running locally on the owner's Mac. Never offer email as a substitute for an Apple Messages request.
 For GitHub, treat access as read-only: you may inspect repositories, files, commits, issues, pull requests, reviews, and comments, but never create, edit, merge, close, delete, or dispatch anything.
 For Vercel, treat access as read-only: you may inspect projects, deployments, domains, status, and logs, but never create, deploy, promote, redeploy, assign aliases, add or edit domains, change environment variables or settings, buy anything, or delete anything.
 Reply in one or two short spoken sentences unless the user asks for detail.`;
@@ -67,10 +67,16 @@ async function generateBuddyReply({ model, messages, tools, system = buddySystem
     model,
     system,
     messages,
-    maxOutputTokens: 800,
+    maxOutputTokens: 500,
     tools,
-    stopWhen: stepCountIs(6),
+    stopWhen: stepCountIs(4),
   });
+}
+
+function cleanBuddyReply(text) {
+  const withoutThinkBlocks = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const closingThink = withoutThinkBlocks.lastIndexOf('</think>');
+  return (closingThink >= 0 ? withoutThinkBlocks.slice(closingThink + 8) : withoutThinkBlocks).trim();
 }
 
 async function replyToBuddy(transcript, messages) {
@@ -82,27 +88,24 @@ async function replyToBuddy(transcript, messages) {
   }
 
   const requestId = ++buddyRequestId;
-  const composioTools = await getBuddyTools();
-  const messagesTools = process.platform === 'darwin' && !process.env.VERCEL
+  const route = classifyRequest(transcript);
+  const needsTools = route === 'tools';
+  const composioTools = needsTools ? await getBuddyTools(transcript) : {};
+  const messagesTools = needsTools && process.platform === 'darwin' && !process.env.VERCEL
     ? getMessagesTools(requestId)
     : {};
   const tools = { ...composioTools, ...messagesTools };
-  const route = classifyRequest(transcript);
   const conversation = normalizeConversation(messages, transcript);
   const localMessagesRules = Object.keys(messagesTools).length
     ? '\nFor Apple Messages, always prepare and read back the draft first. Send only after a separate explicit confirmation.'
     : '';
   const system = buddySystemPrompt + localMessagesRules;
 
-  if (route === 'tools' || route === 'coding' || route === 'reasoning') {
+  if (route === 'coding') {
     if (!process.env.ANTHROPIC_API_KEY) throw new Error('Buddy needs its Claude key for this request.');
-    const modelId = route === 'tools'
-      ? process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001'
-      : route === 'coding'
-      ? process.env.ANTHROPIC_CODING_MODEL || 'claude-sonnet-5'
-      : process.env.ANTHROPIC_REASONING_MODEL || 'claude-sonnet-5';
+    const modelId = process.env.ANTHROPIC_CODING_MODEL || 'claude-sonnet-5';
     const result = await generateBuddyReply({ model: anthropic(modelId), messages: conversation, tools, system });
-    return { message: result.text.trim(), mode: 'claude', route, model: modelId };
+    return { message: cleanBuddyReply(result.text), mode: 'claude', route, model: modelId };
   }
 
   if (process.env.GROQ_API_KEY) {
@@ -113,18 +116,20 @@ async function replyToBuddy(transcript, messages) {
     ];
     for (const modelId of [...new Set(modelIds)]) {
       try {
-        const result = await generateBuddyReply({ model: groq(modelId), messages: conversation, tools, system });
-        return { message: result.text.trim(), mode: 'groq', route, model: modelId };
+        const result = await generateBuddyReply({
+          model: groq(modelId),
+          messages: conversation,
+          tools,
+          system
+        });
+        return { message: cleanBuddyReply(result.text), mode: 'groq', route, model: modelId };
       } catch (error) {
         console.warn(`Groq model ${modelId} unavailable; trying fallback.`, error instanceof Error ? error.message : error);
       }
     }
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) throw new Error('Buddy could not reach an available AI model.');
-  const modelId = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
-  const result = await generateBuddyReply({ model: anthropic(modelId), messages: conversation, tools, system });
-  return { message: result.text.trim(), mode: 'claude', route, model: modelId };
+  throw new Error('Buddy could not reach an available Groq model.');
 }
 
 const resolveContactScript = `
@@ -245,21 +250,61 @@ async function composioRequest(pathname, options = {}) {
   return data;
 }
 
-async function getBuddyComposioSession() {
-  if (composioSession) return composioSession;
+const directToolsByProfile = {
+  gmail_read: ['GMAIL_FETCH_EMAILS'],
+  gmail_write: [
+    'GMAIL_CREATE_EMAIL_DRAFT',
+    'GMAIL_SEND_DRAFT',
+    'GMAIL_SEND_EMAIL'
+  ],
+  spotify_profile: ['SPOTIFY_GET_CURRENT_USER_S_PROFILE'],
+  spotify_playback: [
+    'SPOTIFY_SEARCH_FOR_ITEM',
+    'SPOTIFY_GET_AVAILABLE_DEVICES',
+    'SPOTIFY_GET_PLAYBACK_STATE',
+    'SPOTIFY_START_RESUME_PLAYBACK',
+    'SPOTIFY_PAUSE_PLAYBACK',
+    'SPOTIFY_TRANSFER_PLAYBACK',
+    'SPOTIFY_SKIP_TO_NEXT',
+    'SPOTIFY_SKIP_TO_PREVIOUS'
+  ]
+};
+
+function requestedToolProfile(transcript) {
+  if (/\b(gmail|e-?mail|inbox)\b/i.test(transcript)) {
+    return /\b(read|fetch|find|show|list|latest|newest|recent|inbox|subject)\b/i.test(transcript)
+      ? 'gmail_read'
+      : 'gmail_write';
+  }
+  if (/\bspotify\b/i.test(transcript)) {
+    return /\b(profile|display name|account)\b/i.test(transcript) ? 'spotify_profile' : 'spotify_playback';
+  }
+  return 'general';
+}
+
+async function getBuddyComposioSession(profile) {
+  if (composioSessions.has(profile)) return composioSessions.get(profile);
+  const toolkit = profile.split('_')[0];
   const vercelAccountId = await getLatestActiveConnectedAccountId('vercel');
-  composioSession = await composioRequest('/tool_router/session', {
+  const directTools = directToolsByProfile[profile];
+  const session = await composioRequest('/tool_router/session', {
     method: 'POST',
     body: JSON.stringify({
       user_id: 'buddy-owner',
-      toolkits: { enable: ['gmail', 'spotify', 'github', 'vercel'] },
-      auth_configs: { spotify: 'ac_qbhoTCOXoeiu' },
+      toolkits: { enable: directTools ? [toolkit] : ['github', 'vercel'] },
+      ...(directTools ? {
+        tools: { [toolkit]: { enable: directTools } },
+        session_preset: 'direct_tools',
+        sandbox: { enable: false }
+      } : {}),
+      ...(toolkit === 'spotify' ? { auth_configs: { spotify: 'ac_qbhoTCOXoeiu' } } : {}),
       ...(vercelAccountId
         ? { connected_accounts: { vercel: [vercelAccountId] } }
         : {})
     })
   });
-  return composioSession;
+  composioSessions.set(profile, session);
+  return session;
 }
 
 async function getLatestActiveConnectedAccountId(toolkit) {
@@ -276,20 +321,23 @@ async function getLatestActiveConnectedAccountId(toolkit) {
     .sort((left, right) => new Date(right.updated_at) - new Date(left.updated_at))[0]?.id;
 }
 
-async function getBuddyTools() {
-  const session = await getBuddyComposioSession();
-  if (!composioMcpClient) {
-    composioMcpClient = await createMCPClient({
+async function getBuddyTools(transcript) {
+  const profile = requestedToolProfile(transcript);
+  const session = await getBuddyComposioSession(profile);
+  if (!composioMcpClients.has(profile)) {
+    composioMcpClients.set(profile, await createMCPClient({
       transport: {
         type: 'http',
         url: session.mcp.url,
         headers: { 'x-api-key': process.env.COMPOSIO_API_KEY }
       }
-    });
+    }));
   }
-  const tools = await composioMcpClient.tools();
+  const tools = await composioMcpClients.get(profile).tools();
+  if (directToolsByProfile[profile]) return tools;
+  const compactToolNames = new Set(['COMPOSIO_SEARCH_TOOLS', 'COMPOSIO_MULTI_EXECUTE_TOOL']);
   return Object.fromEntries(
-    Object.entries(tools).filter(([name]) => !name.includes('REMOTE_'))
+    Object.entries(tools).filter(([name]) => compactToolNames.has(name))
   );
 }
 
