@@ -28,6 +28,7 @@ let currentAudio, lastUserActivity = Date.now(), nextJobId = 1;
 const speechQueue = [];
 const backgroundJobs = new Map();
 let pendingArtifact;
+let pendingCompositionRequest;
 const conversationStorageKey = 'buddy-conversation-v1';
 let conversation = [];
 try {
@@ -345,7 +346,12 @@ async function prepareEmailArtifact(request) {
   say(acknowledgement, startRecognition);
   try {
     const data = await requestBuddy(request, 'compose_email');
-    if (data.draft) pendingArtifact = { ...data.draft, originalRequest: request, reviewed: false };
+    if (data.draft) {
+      pendingArtifact = { ...data.draft, originalRequest: request, reviewed: false };
+      pendingCompositionRequest = undefined;
+    } else {
+      pendingCompositionRequest = request;
+    }
     saveConversation(request, data.message);
     reply.querySelector('p').textContent = data.message;
     say(data.message, startRecognition);
@@ -420,6 +426,17 @@ async function runBackgroundAction(request) {
 }
 
 async function answer(request) {
+  if (pendingCompositionRequest) {
+    if (/^(never mind|cancel|stop)(?:[.!])?$/i.test(request.trim())) {
+      pendingCompositionRequest = undefined;
+      say('No problem—I’ve cancelled that draft.', startRecognition);
+      return;
+    }
+    const originalRequest = pendingCompositionRequest;
+    pendingCompositionRequest = undefined;
+    prepareEmailArtifact(`${originalRequest}\nAdditional information from Wells: ${request}`);
+    return;
+  }
   if (pendingArtifact && /\b(show|display|open|edit|change|correct|fix)\b.*\b(it|email|draft|text)\b|\b(show|display|edit) (?:the )?(?:email|draft)\b/i.test(request)) {
     showArtifactEditor();
     return;
