@@ -21,7 +21,8 @@ const composioSessions = new Map();
 const composioMcpClients = new Map();
 let pendingMessage;
 let buddyRequestId = 0;
-const buddySystemPrompt = `You are Buddy, a warm, concise desk companion with Gmail, Spotify, GitHub, and Vercel tools.
+const buddySystemPrompt = `You are Buddy, a quick, warm helper-friend with Gmail, Spotify, GitHub, and Vercel tools.
+Sound natural, upbeat, and relaxed, like a capable friend beside the user—not a formal customer-service assistant.
 Use tools only when the user asks for an action or current account information.
 When tools are needed, call the relevant app tool immediately without a spoken preamble and report only the confirmed result.
 Never claim an action succeeded unless its tool result confirms it.
@@ -29,7 +30,7 @@ For email, create a draft by default; only send when the user clearly says to se
 Apple Messages is available only when Buddy is running locally on the owner's Mac. Never offer email as a substitute for an Apple Messages request.
 For GitHub, treat access as read-only: you may inspect repositories, files, commits, issues, pull requests, reviews, and comments, but never create, edit, merge, close, delete, or dispatch anything.
 For Vercel, treat access as read-only: you may inspect projects, deployments, domains, status, and logs, but never create, deploy, promote, redeploy, assign aliases, add or edit domains, change environment variables or settings, buy anything, or delete anything.
-Reply in one or two short spoken sentences unless the user asks for detail.`;
+Reply promptly in one or two short spoken sentences unless the user asks for detail. Never pad a reply with generic filler.`;
 
 function classifyRequest(transcript) {
   const integration = /\b(spotify|gmail|e-?mail|inbox|message|text|github|repository|repo|vercel|deployment|calendar)\b/i;
@@ -72,6 +73,22 @@ function cleanBuddyReply(text) {
   return (closingThink >= 0 ? withoutThinkBlocks.slice(closingThink + 8) : withoutThinkBlocks).trim();
 }
 
+async function summarizeToolOutcome(transcript, result) {
+  const toolResults = result.steps.flatMap((step) => step.toolResults || []);
+  if (!toolResults.length) return '';
+  const compactResults = toolResults.map(({ toolName, output }) => ({ toolName, output }));
+  const summary = await generateText({
+    model: groq(process.env.GROQ_FAST_MODEL || 'openai/gpt-oss-20b'),
+    system: 'Give the user a friendly, factual one-sentence spoken update. Use only the tool results. Never claim success if the result shows an error.',
+    messages: [{
+      role: 'user',
+      content: `Request: ${transcript}\nTool results: ${JSON.stringify(compactResults).slice(0, 6_000)}`
+    }],
+    maxOutputTokens: 160
+  });
+  return cleanBuddyReply(summary.text);
+}
+
 async function replyToBuddy(transcript, messages) {
   if (process.env.BUDDY_AI_ENABLED !== 'true') {
     throw new Error('Buddy AI is turned off.');
@@ -103,7 +120,11 @@ async function replyToBuddy(transcript, messages) {
 
   if (process.env.GROQ_API_KEY) {
     const modelIds = [
-      process.env.GROQ_PRIMARY_MODEL || 'qwen/qwen3.8-27b',
+      route === 'simple'
+        ? process.env.GROQ_FAST_MODEL || 'openai/gpt-oss-20b'
+        : route === 'tools'
+          ? process.env.GROQ_TOOL_MODEL || 'openai/gpt-oss-20b'
+          : process.env.GROQ_PRIMARY_MODEL || 'qwen/qwen3.8-27b',
       ...(process.env.GROQ_FALLBACK_MODELS || 'llama-3.3-70b-versatile,qwen/qwen3.6-27b')
         .split(',').map((model) => model.trim()).filter(Boolean)
     ];
@@ -115,7 +136,8 @@ async function replyToBuddy(transcript, messages) {
           tools,
           system
         });
-        return { message: cleanBuddyReply(result.text), mode: 'groq', route, model: modelId };
+        const message = cleanBuddyReply(result.text) || await summarizeToolOutcome(transcript, result);
+        return { message: message || 'That’s finished.', mode: 'groq', route, model: modelId };
       } catch (error) {
         console.warn(`Groq model ${modelId} unavailable; trying fallback.`, error instanceof Error ? error.message : error);
       }
@@ -245,32 +267,53 @@ async function composioRequest(pathname, options = {}) {
 
 const directToolsByProfile = {
   gmail_read: ['GMAIL_FETCH_EMAILS'],
-  gmail_write: [
-    'GMAIL_CREATE_EMAIL_DRAFT',
-    'GMAIL_SEND_DRAFT',
-    'GMAIL_SEND_EMAIL'
-  ],
+  gmail_draft: ['GMAIL_CREATE_EMAIL_DRAFT'],
+  gmail_send: ['GMAIL_SEND_EMAIL'],
   spotify_profile: ['SPOTIFY_GET_CURRENT_USER_S_PROFILE'],
-  spotify_playback: [
+  spotify_current: ['SPOTIFY_GET_PLAYBACK_STATE'],
+  spotify_play: [
     'SPOTIFY_SEARCH_FOR_ITEM',
     'SPOTIFY_GET_AVAILABLE_DEVICES',
-    'SPOTIFY_GET_PLAYBACK_STATE',
     'SPOTIFY_START_RESUME_PLAYBACK',
+    'SPOTIFY_TRANSFER_PLAYBACK'
+  ],
+  spotify_pause: [
+    'SPOTIFY_GET_AVAILABLE_DEVICES',
     'SPOTIFY_PAUSE_PLAYBACK',
-    'SPOTIFY_TRANSFER_PLAYBACK',
-    'SPOTIFY_SKIP_TO_NEXT',
-    'SPOTIFY_SKIP_TO_PREVIOUS'
-  ]
+  ],
+  spotify_resume: ['SPOTIFY_GET_AVAILABLE_DEVICES', 'SPOTIFY_START_RESUME_PLAYBACK'],
+  spotify_next: ['SPOTIFY_SKIP_TO_NEXT'],
+  spotify_previous: ['SPOTIFY_SKIP_TO_PREVIOUS']
+};
+
+const compactToolDescriptions = {
+  GMAIL_FETCH_EMAILS: 'Find or read emails in the owner’s Gmail account.',
+  GMAIL_CREATE_EMAIL_DRAFT: 'Create a Gmail draft. Do not send it.',
+  GMAIL_SEND_EMAIL: 'Send an email only when the user explicitly asked to send it.',
+  SPOTIFY_GET_CURRENT_USER_S_PROFILE: 'Read the connected Spotify profile.',
+  SPOTIFY_GET_PLAYBACK_STATE: 'Read what Spotify is currently playing.',
+  SPOTIFY_SEARCH_FOR_ITEM: 'Search Spotify for music.',
+  SPOTIFY_GET_AVAILABLE_DEVICES: 'List available Spotify playback devices.',
+  SPOTIFY_START_RESUME_PLAYBACK: 'Start or resume Spotify playback.',
+  SPOTIFY_TRANSFER_PLAYBACK: 'Move Spotify playback to a named device.',
+  SPOTIFY_PAUSE_PLAYBACK: 'Pause Spotify playback.',
+  SPOTIFY_SKIP_TO_NEXT: 'Skip to the next Spotify item.',
+  SPOTIFY_SKIP_TO_PREVIOUS: 'Return to the previous Spotify item.'
 };
 
 function requestedToolProfile(transcript) {
   if (/\b(gmail|e-?mail|inbox)\b/i.test(transcript)) {
-    return /\b(read|fetch|find|show|list|latest|newest|recent|inbox|subject)\b/i.test(transcript)
-      ? 'gmail_read'
-      : 'gmail_write';
+    if (/\b(read|fetch|find|show|list|latest|newest|recent|inbox|subject)\b/i.test(transcript)) return 'gmail_read';
+    return /\bsend\b/i.test(transcript) ? 'gmail_send' : 'gmail_draft';
   }
   if (/\bspotify\b/i.test(transcript)) {
-    return /\b(profile|display name|account)\b/i.test(transcript) ? 'spotify_profile' : 'spotify_playback';
+    if (/\b(profile|display name|account)\b/i.test(transcript)) return 'spotify_profile';
+    if (/\b(current|currently|what(?:'s| is) playing|playback state)\b/i.test(transcript)) return 'spotify_current';
+    if (/\bpause|stop\b/i.test(transcript)) return 'spotify_pause';
+    if (/\bresume|continue\b/i.test(transcript)) return 'spotify_resume';
+    if (/\bnext|skip\b/i.test(transcript)) return 'spotify_next';
+    if (/\bprevious|back\b/i.test(transcript)) return 'spotify_previous';
+    return 'spotify_play';
   }
   return 'general';
 }
@@ -327,7 +370,16 @@ async function getBuddyTools(transcript) {
     }));
   }
   const tools = await composioMcpClients.get(profile).tools();
-  if (directToolsByProfile[profile]) return tools;
+  if (directToolsByProfile[profile]) {
+    return Object.fromEntries(Object.entries(tools).map(([name, remoteTool]) => [
+      name,
+      tool({
+        description: compactToolDescriptions[name] || 'Use the connected app for this requested action.',
+        inputSchema: remoteTool.inputSchema,
+        execute: (...args) => remoteTool.execute(...args)
+      })
+    ]));
+  }
   const compactToolNames = new Set(['COMPOSIO_SEARCH_TOOLS', 'COMPOSIO_MULTI_EXECUTE_TOOL']);
   return Object.fromEntries(
     Object.entries(tools).filter(([name]) => compactToolNames.has(name))

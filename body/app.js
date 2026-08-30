@@ -15,10 +15,13 @@ const voiceRing = document.querySelector('#voice-ring');
 const ringContext = voiceRing.getContext('2d');
 const voiceToggle = document.querySelector('#voice-toggle');
 const wakePattern = /\b(?:hey|hi|hay)\s+(?:buddy|buddey|buddie|body)\b[,.]?\s*/i;
-let imageIndex = 0, busy = false, awake = false, voiceEnabled = true, speaking = false;
+let imageIndex = 0, awake = false, voiceEnabled = true, speaking = false;
 let audioContext, micAnalyser, micStream, activeAnalyser, ringFrame, mediaRecorder;
 let voiceMonitorFrame, speechStartedAt = 0, silenceStartedAt = 0, transcribing = false, recordingStopping = false;
 let voiceColorPhase = 0;
+let currentAudio, lastUserActivity = Date.now(), nextJobId = 1;
+const speechQueue = [];
+const backgroundJobs = new Map();
 const conversationStorageKey = 'buddy-conversation-v1';
 let conversation = [];
 try {
@@ -119,13 +122,13 @@ function recorderMimeType() {
 }
 
 function startSpeechRecording() {
-  if (!micStream || mediaRecorder?.state === 'recording' || recordingStopping || busy || speaking || transcribing) return;
+  if (!micStream || mediaRecorder?.state === 'recording' || recordingStopping || speaking || transcribing) return;
   const chunks = [];
   mediaRecorder = new MediaRecorder(micStream, recorderMimeType() ? { mimeType: recorderMimeType() } : undefined);
   mediaRecorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
   mediaRecorder.onstop = async () => {
     recordingStopping = false;
-    if (!chunks.length || busy || speaking || !voiceEnabled) return;
+    if (!chunks.length || speaking || !voiceEnabled) return;
     const audio = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
     if (audio.size < 1_000) return;
     transcribing = true;
@@ -160,7 +163,7 @@ function stopSpeechRecording() {
 }
 
 function monitorVoiceActivity(time = 0) {
-  if (voiceEnabled && !busy && !speaking && micAnalyser) {
+  if (voiceEnabled && !speaking && micAnalyser) {
     const samples = new Uint8Array(micAnalyser.fftSize);
     micAnalyser.getByteTimeDomainData(samples);
     let energy = 0;
@@ -180,7 +183,8 @@ function monitorVoiceActivity(time = 0) {
 
 function handleRecognizedSpeech(words) {
   const cleanWords = words.trim();
-  if (!cleanWords || busy || speaking) return;
+  if (!cleanWords || speaking) return;
+  lastUserActivity = Date.now();
   const wakeMatch = cleanWords.match(wakePattern);
   if (!awake && wakeMatch) {
     awake = true;
@@ -210,27 +214,37 @@ async function connectResponseMeter(audio) {
   } catch (_) { activeAnalyser = undefined; }
 }
 
-async function say(text, onend) {
+function say(text, onend) {
+  if (!text?.trim()) return onend?.();
+  speechQueue.push({ text: text.trim(), onend });
+  playNextSpeech();
+}
+
+async function playNextSpeech() {
+  if (speaking || !speechQueue.length || !voiceEnabled) return;
+  const { text, onend } = speechQueue.shift();
   speaking = true;
   orb.classList.remove('is-listening');
   orb.classList.add('is-speaking');
   stopSpeechRecording();
   const finish = () => {
     speaking = false;
+    currentAudio = undefined;
     orb.classList.remove('is-speaking');
     activeAnalyser = micAnalyser;
     onend?.();
+    playNextSpeech();
   };
   try {
     const response = await fetch('/api/voice', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text })
     });
     if (!response.ok) throw new Error('ElevenLabs voice unavailable');
-    const audio = new Audio(URL.createObjectURL(await response.blob()));
-    await connectResponseMeter(audio);
-    audio.onended = finish;
-    audio.onerror = finish;
-    await audio.play();
+    currentAudio = new Audio(URL.createObjectURL(await response.blob()));
+    await connectResponseMeter(currentAudio);
+    currentAudio.onended = finish;
+    currentAudio.onerror = finish;
+    await currentAudio.play();
   } catch (_) {
     if (!('speechSynthesis' in window)) return finish();
     const voice = new SpeechSynthesisUtterance(text);
@@ -246,46 +260,119 @@ function acknowledgeWake() {
   const message = 'I’m here.';
   showTranscript('I’m listening…');
   reply.querySelector('p').textContent = message;
-  say(message, () => { if (voiceEnabled && !busy) startRecognition(); });
+  say(message, () => { if (voiceEnabled) startRecognition(); });
+}
+
+function isBackgroundAction(request) {
+  const action = /\b(write|draft|send|email|message|text|reply|forward|find|read|check|play|put on|pause|resume|skip|open|create|update|search|look up|inspect)\b/i;
+  const service = /\b(email|e-mail|gmail|spotify|message|text|github|repo|repository|vercel|deployment)\b/i;
+  return action.test(request) && service.test(request);
+}
+
+function actionAcknowledgement(request) {
+  if (/\b(email|e-mail|gmail)\b/i.test(request)) return /\b(send)\b/i.test(request)
+    ? 'Yes—checking that and sending it now.'
+    : 'Yes—writing that email now.';
+  if (/\bspotify\b/i.test(request)) return 'Yep—sorting Spotify now.';
+  if (/\b(message|text)\b/i.test(request)) return 'Yep—working on that message now.';
+  if (/\b(github|repo|repository)\b/i.test(request)) return 'Sure—I’m checking GitHub now.';
+  if (/\b(vercel|deployment)\b/i.test(request)) return 'Sure—I’m checking that deployment now.';
+  return 'Yep—I’m on it.';
+}
+
+function saveConversation(userMessage, assistantMessage) {
+  conversation.push(
+    { role: 'user', content: userMessage },
+    { role: 'assistant', content: assistantMessage }
+  );
+  if (conversation.length > 20) conversation.splice(0, conversation.length - 20);
+  localStorage.setItem(conversationStorageKey, JSON.stringify(conversation));
+}
+
+async function requestBuddy(request) {
+  const response = await fetch('/api/buddy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcript: request, messages: conversation.slice(-20) })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Buddy could not respond.');
+  return data.message;
+}
+
+function latestJobStatusReply() {
+  const latest = [...backgroundJobs.values()].at(-1);
+  if (!latest) return '';
+  if (latest.status === 'running') return `I’m still ${latest.activity}. I’ll tell you the moment it’s ready.`;
+  if (latest.status === 'failed') return `That job hit a problem: ${latest.result}`;
+  return `It’s finished. ${latest.result}`;
+}
+
+function announceJobWhenFree(job) {
+  if (job.announced || !voiceEnabled) return;
+  const userIsActive = Date.now() - lastUserActivity < 1400;
+  const microphoneIsActive = mediaRecorder?.state === 'recording' || transcribing;
+  if (speaking || speechQueue.length || userIsActive || microphoneIsActive) {
+    setTimeout(() => announceJobWhenFree(job), 500);
+    return;
+  }
+  job.announced = true;
+  const notice = job.status === 'done'
+    ? `By the way, that’s finished. ${job.result}`
+    : `Quick update—that didn’t work. ${job.result}`;
+  reply.querySelector('p').textContent = notice;
+  say(notice, startRecognition);
+}
+
+async function runBackgroundAction(request) {
+  const acknowledgement = actionAcknowledgement(request);
+  const job = {
+    id: nextJobId++, request, status: 'running', result: '', announced: false,
+    activity: acknowledgement.replace(/^(yes|yep|sure)[—,\s]+/i, '').replace(/[.!]$/, '').toLowerCase()
+  };
+  backgroundJobs.set(job.id, job);
+  reply.querySelector('p').textContent = acknowledgement;
+  say(acknowledgement, startRecognition);
+  try {
+    job.result = await requestBuddy(request);
+    job.status = 'done';
+    saveConversation(request, job.result);
+  } catch (error) {
+    console.warn('Buddy background action failed.', error);
+    job.status = 'failed';
+    job.result = error instanceof Error ? error.message : 'I couldn’t finish it.';
+  }
+  announceJobWhenFree(job);
 }
 
 async function answer(request) {
-  if (busy) return;
-  busy = true;
+  if (/\b(is it done|are you done|finished yet|how is that going|what's the status|what is the status)\b/i.test(request)) {
+    const status = latestJobStatusReply();
+    if (status) {
+      reply.querySelector('p').textContent = status;
+      say(status, startRecognition);
+      return;
+    }
+  }
+  if (isBackgroundAction(request)) {
+    runBackgroundAction(request);
+    return;
+  }
   try {
-    const response = await fetch('/api/buddy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript: request, messages: conversation.slice(-20) })
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'Buddy could not respond.');
-    const message = data.message;
-    conversation.push(
-      { role: 'user', content: request },
-      { role: 'assistant', content: message }
-    );
-    if (conversation.length > 20) conversation.splice(0, conversation.length - 20);
-    localStorage.setItem(conversationStorageKey, JSON.stringify(conversation));
+    const message = await requestBuddy(request);
+    saveConversation(request, message);
     reply.querySelector('p').textContent = message;
     orb.classList.remove('is-listening');
-    say(message, resetVoice);
+    say(message, startRecognition);
   } catch (error) {
     console.warn('Buddy API unavailable.', error);
-    busy = false;
     orb.classList.remove('is-listening', 'is-speaking');
     startRecognition();
   }
 }
 
-function resetVoice() {
-  busy = false;
-  // Once Buddy has been woken, keep the conversation open until Voice is turned off.
-  setTimeout(startRecognition, 350);
-}
-
 async function startRecognition() {
-  if (busy || !voiceEnabled || speaking) return;
+  if (!voiceEnabled || speaking) return;
   await startMicMeter();
   if (awake) {
     orb.classList.add('is-listening');
@@ -301,13 +388,15 @@ voiceToggle.addEventListener('click', () => {
     startRecognition();
   } else {
     awake = false;
-    busy = false;
+    speechQueue.length = 0;
     orb.classList.remove('is-listening', 'is-speaking');
     stopSpeechRecording();
     micStream?.getTracks().forEach(track => track.stop());
     micStream = undefined;
     micAnalyser = undefined;
     activeAnalyser = undefined;
+    currentAudio?.pause();
+    currentAudio = undefined;
     window.speechSynthesis?.cancel();
     speaking = false;
     reply.querySelector('p').textContent = 'Voice is off — no requests will be sent.';
