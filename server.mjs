@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,22 @@ const composioSessions = new Map();
 const composioMcpClients = new Map();
 let pendingMessage;
 let buddyRequestId = 0;
+async function stageTimeout(promise, milliseconds, stage) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${stage} timed out after ${milliseconds}ms.`)), milliseconds);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const trace = (requestId, event, details = {}) => console.log(JSON.stringify({
+  source: 'buddy-server', requestId, event, at: new Date().toISOString(), ...details
+}));
 const buddySystemPrompt = `You are Buddy, a quick, warm helper-friend with Gmail, Spotify, GitHub, and Vercel tools.
 Sound natural, upbeat, and relaxed, like a capable friend beside the user—not a formal customer-service assistant.
 Use tools only when the user asks for an action or current account information.
@@ -56,7 +73,7 @@ function normalizeConversation(messages, transcript) {
   return history.slice(-20);
 }
 
-async function generateBuddyReply({ model, messages, tools, system = buddySystemPrompt }) {
+async function generateBuddyReply({ model, messages, tools, system = buddySystemPrompt, timeoutMs = 18_000 }) {
   return generateText({
     model,
     system,
@@ -64,6 +81,7 @@ async function generateBuddyReply({ model, messages, tools, system = buddySystem
     maxOutputTokens: 500,
     tools,
     stopWhen: stepCountIs(4),
+    abortSignal: AbortSignal.timeout(timeoutMs)
   });
 }
 
@@ -84,7 +102,8 @@ async function summarizeToolOutcome(transcript, result) {
       role: 'user',
       content: `Request: ${transcript}\nTool results: ${JSON.stringify(compactResults).slice(0, 6_000)}`
     }],
-    maxOutputTokens: 160
+    maxOutputTokens: 160,
+    abortSignal: AbortSignal.timeout(10_000)
   });
   return cleanBuddyReply(summary.text);
 }
@@ -104,7 +123,8 @@ Otherwise return the intended recipient exactly as supplied, a useful subject, a
       body: z.string(),
       clarification: z.string()
     }) }),
-    maxOutputTokens: 700
+    maxOutputTokens: 700,
+    abortSignal: AbortSignal.timeout(20_000)
   });
   const draft = result.output;
   if (draft.clarification.trim()) return { message: draft.clarification.trim() };
@@ -119,7 +139,7 @@ Otherwise return the intended recipient exactly as supplied, a useful subject, a
   };
 }
 
-async function replyToBuddy(transcript, messages) {
+async function replyToBuddy(transcript, messages, requestId) {
   if (process.env.BUDDY_AI_ENABLED !== 'true') {
     throw new Error('Buddy AI is turned off.');
   }
@@ -127,12 +147,14 @@ async function replyToBuddy(transcript, messages) {
     throw new Error('Buddy is missing its AI provider keys.');
   }
 
-  const requestId = ++buddyRequestId;
+  const localRequestId = ++buddyRequestId;
   const route = classifyRequest(transcript);
+  const startedAt = Date.now();
+  trace(requestId, 'route_selected', { route, transcriptLength: transcript.length });
   const needsTools = route === 'tools';
-  const composioTools = needsTools ? await getBuddyTools(transcript) : {};
+  const composioTools = needsTools ? await getBuddyTools(transcript, requestId) : {};
   const messagesTools = needsTools && process.platform === 'darwin' && !process.env.VERCEL
-    ? getMessagesTools(requestId)
+    ? getMessagesTools(localRequestId)
     : {};
   const tools = { ...composioTools, ...messagesTools };
   const conversation = normalizeConversation(messages, transcript);
@@ -144,31 +166,52 @@ async function replyToBuddy(transcript, messages) {
   if (route === 'coding') {
     if (!process.env.ANTHROPIC_API_KEY) throw new Error('Buddy needs its Claude key for this request.');
     const modelId = process.env.ANTHROPIC_CODING_MODEL || 'claude-sonnet-5';
+    trace(requestId, 'model_attempt', { provider: 'anthropic', model: modelId });
     const result = await generateBuddyReply({ model: anthropic(modelId), messages: conversation, tools, system });
+    trace(requestId, 'model_complete', { provider: 'anthropic', model: modelId, durationMs: Date.now() - startedAt });
     return { message: cleanBuddyReply(result.text), mode: 'claude', route, model: modelId };
   }
 
   if (process.env.GROQ_API_KEY) {
+    const fallbackModels = route === 'tools'
+      ? []
+      : (process.env.GROQ_FALLBACK_MODELS || 'qwen/qwen3.6-27b')
+          .split(',')
+          .map((model) => model.trim())
+          .filter((model) => model && model !== 'llama-3.3-70b-versatile' && model !== 'llama-3.1-8b-instant');
     const modelIds = [
       route === 'simple'
         ? process.env.GROQ_FAST_MODEL || 'openai/gpt-oss-20b'
         : route === 'tools'
           ? process.env.GROQ_TOOL_MODEL || 'openai/gpt-oss-20b'
           : process.env.GROQ_PRIMARY_MODEL || 'qwen/qwen3.8-27b',
-      ...(process.env.GROQ_FALLBACK_MODELS || 'llama-3.3-70b-versatile,qwen/qwen3.6-27b')
-        .split(',').map((model) => model.trim()).filter(Boolean)
+      ...fallbackModels
     ];
     for (const modelId of [...new Set(modelIds)]) {
+      if (Date.now() - startedAt > 42_000) {
+        trace(requestId, 'deadline_reached', { durationMs: Date.now() - startedAt });
+        break;
+      }
       try {
+        trace(requestId, 'model_attempt', { provider: 'groq', model: modelId });
         const result = await generateBuddyReply({
           model: groq(modelId),
           messages: conversation,
           tools,
-          system
+          system,
+          timeoutMs: route === 'tools' ? 22_000 : 14_000
         });
         const message = cleanBuddyReply(result.text) || await summarizeToolOutcome(transcript, result);
+        trace(requestId, 'model_complete', {
+          provider: 'groq', model: modelId, durationMs: Date.now() - startedAt,
+          steps: result.steps.length, toolCalls: result.steps.reduce((total, step) => total + step.toolCalls.length, 0)
+        });
         return { message: message || 'That’s finished.', mode: 'groq', route, model: modelId };
       } catch (error) {
+        trace(requestId, 'model_error', {
+          provider: 'groq', model: modelId, durationMs: Date.now() - startedAt,
+          error: error instanceof Error ? error.message : String(error)
+        });
         console.warn(`Groq model ${modelId} unavailable; trying fallback.`, error instanceof Error ? error.message : error);
       }
     }
@@ -272,6 +315,7 @@ async function synthesizeBuddyVoice(text) {
     `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}?output_format=mp3_44100_128`,
     {
       method: 'POST',
+      signal: AbortSignal.timeout(20_000),
       headers: { 'Content-Type': 'application/json', 'xi-api-key': process.env.ELEVENLABS_API_KEY },
       body: JSON.stringify({
         text,
@@ -288,6 +332,7 @@ async function composioRequest(pathname, options = {}) {
   if (!process.env.COMPOSIO_API_KEY) throw new Error('Buddy is missing its Composio API key.');
   const response = await fetch(`https://backend.composio.dev/api/v3.1${pathname}`, {
     ...options,
+    signal: options.signal || AbortSignal.timeout(10_000),
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': process.env.COMPOSIO_API_KEY,
@@ -361,11 +406,15 @@ async function getBuddyComposioSession(profile) {
     method: 'POST',
     body: JSON.stringify({
       user_id: 'buddy-owner',
+      mcp: true,
       toolkits: { enable: directTools ? [toolkit] : ['github', 'vercel'] },
       ...(directTools ? {
         tools: { [toolkit]: { enable: directTools } },
-        session_preset: 'direct_tools',
-        sandbox: { enable: false }
+        preload: { tools: directTools },
+        search: { enable: false },
+        execute: { enable_multi_execute: false },
+        manage_connections: { enable: false },
+        workbench: { enable: false }
       } : {}),
       ...(toolkit === 'spotify' ? { auth_configs: { spotify: 'ac_qbhoTCOXoeiu' } } : {}),
       ...(vercelAccountId
@@ -391,26 +440,43 @@ async function getLatestActiveConnectedAccountId(toolkit) {
     .sort((left, right) => new Date(right.updated_at) - new Date(left.updated_at))[0]?.id;
 }
 
-async function getBuddyTools(transcript) {
+async function getBuddyTools(transcript, requestId) {
   const profile = requestedToolProfile(transcript);
-  const session = await getBuddyComposioSession(profile);
+  trace(requestId, 'composio_session_start', { profile });
+  const session = await stageTimeout(getBuddyComposioSession(profile), 12_000, 'Composio session setup');
+  trace(requestId, 'composio_session_ready', { profile });
   if (!composioMcpClients.has(profile)) {
-    composioMcpClients.set(profile, await createMCPClient({
+    composioMcpClients.set(profile, await stageTimeout(createMCPClient({
       transport: {
         type: 'http',
         url: session.mcp.url,
         headers: { 'x-api-key': process.env.COMPOSIO_API_KEY }
       }
-    }));
+    }), 10_000, 'Composio MCP connection'));
   }
-  const tools = await composioMcpClients.get(profile).tools();
+  const tools = await stageTimeout(composioMcpClients.get(profile).tools(), 10_000, 'Composio tool discovery');
+  trace(requestId, 'composio_tools_ready', { profile, count: Object.keys(tools).length });
   if (directToolsByProfile[profile]) {
     return Object.fromEntries(Object.entries(tools).map(([name, remoteTool]) => [
       name,
       tool({
         description: compactToolDescriptions[name] || 'Use the connected app for this requested action.',
         inputSchema: remoteTool.inputSchema,
-        execute: (...args) => remoteTool.execute(...args)
+        execute: async (...args) => {
+          const toolStartedAt = Date.now();
+          trace(requestId, 'tool_start', { profile, tool: name });
+          try {
+            const output = await stageTimeout(remoteTool.execute(...args), 18_000, `${name} execution`);
+            trace(requestId, 'tool_complete', { profile, tool: name, durationMs: Date.now() - toolStartedAt });
+            return output;
+          } catch (error) {
+            trace(requestId, 'tool_error', {
+              profile, tool: name, durationMs: Date.now() - toolStartedAt,
+              error: error instanceof Error ? error.message : String(error)
+            });
+            throw error;
+          }
+        }
       })
     ]));
   }
@@ -425,6 +491,7 @@ async function getConnectLink(toolkit) {
     method: 'POST',
     body: JSON.stringify({
       user_id: 'buddy-owner',
+      mcp: true,
       toolkits: { enable: [toolkit] },
       ...(toolkit === 'spotify'
         ? { auth_configs: { spotify: 'ac_qbhoTCOXoeiu' } }
@@ -440,13 +507,20 @@ async function getConnectLink(toolkit) {
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '8kb' }));
+app.use((request, response, next) => {
+  request.buddyRequestId = request.get('x-buddy-request-id') || request.get('x-vercel-id') || randomUUID();
+  response.set('x-buddy-request-id', request.buddyRequestId);
+  next();
+});
 app.use((_request, response, next) => {
   response.set('Cache-Control', 'no-store');
   next();
 });
 
 app.post('/api/transcribe', express.raw({ type: ['audio/webm', 'audio/ogg', 'audio/mp4'], limit: '12mb' }), async (request, response, next) => {
+  const startedAt = Date.now();
   try {
+    trace(request.buddyRequestId, 'transcription_start', { audioBytes: request.get('content-length') || null });
     if (!process.env.GROQ_API_KEY) throw new Error('Buddy is missing its Groq API key.');
     if (!Buffer.isBuffer(request.body) || !request.body.length) {
       return response.status(400).json({ error: 'Buddy needs recorded audio to transcribe.' });
@@ -462,39 +536,63 @@ app.post('/api/transcribe', express.raw({ type: ['audio/webm', 'audio/ogg', 'aud
     form.append('prompt', 'The assistant wake phrase is Hey Buddy. Transcribe names and app names such as Spotify and Gmail accurately.');
     const transcription = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
+      signal: AbortSignal.timeout(20_000),
       headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
       body: form
     });
     const data = await transcription.json();
     if (!transcription.ok) throw new Error(data.error?.message || 'Groq could not transcribe Buddy’s audio.');
-    return response.json({ text: typeof data.text === 'string' ? data.text.trim() : '' });
+    const text = typeof data.text === 'string' ? data.text.trim() : '';
+    trace(request.buddyRequestId, 'transcription_complete', { durationMs: Date.now() - startedAt, textLength: text.length });
+    return response.json({ text });
   } catch (error) {
     next(error);
   }
 });
 
 app.post('/api/buddy', async (request, response, next) => {
+  const startedAt = Date.now();
   try {
     const { transcript, messages, operation } = request.body || {};
     if (typeof transcript !== 'string' || !transcript.trim()) {
       return response.status(400).json({ error: 'Buddy needs something to respond to.' });
     }
     const cleanTranscript = transcript.trim().slice(0, 2_000);
-    if (operation === 'compose_email') return response.json(await composeEmailDraft(cleanTranscript, messages));
-    return response.json(await replyToBuddy(cleanTranscript, messages));
+    trace(request.buddyRequestId, 'buddy_request_start', { operation: operation || 'reply', transcriptLength: cleanTranscript.length });
+    const result = operation === 'compose_email'
+      ? await stageTimeout(composeEmailDraft(cleanTranscript, messages), 25_000, 'Email composition')
+      : await stageTimeout(replyToBuddy(cleanTranscript, messages, request.buddyRequestId), 48_000, 'Buddy request');
+    trace(request.buddyRequestId, 'buddy_request_complete', { durationMs: Date.now() - startedAt, operation: operation || 'reply' });
+    return response.json(result);
   } catch (error) {
+    trace(request.buddyRequestId, 'buddy_request_error', {
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error)
+    });
     next(error);
   }
 });
 
+app.post('/api/client-log', (request, response) => {
+  const { event, details } = request.body || {};
+  trace(request.buddyRequestId, `client_${String(event || 'unknown').slice(0, 80)}`,
+    details && typeof details === 'object' ? details : {});
+  response.status(204).end();
+});
+
 app.post('/api/voice', async (request, response, next) => {
+  const startedAt = Date.now();
   try {
     const { text } = request.body || {};
     if (typeof text !== 'string' || !text.trim()) {
       return response.status(400).json({ error: 'Buddy needs words to speak.' });
     }
+    const cleanText = text.trim().slice(0, 2_000);
+    trace(request.buddyRequestId, 'voice_start', { textLength: cleanText.length });
+    const audio = await synthesizeBuddyVoice(cleanText);
+    trace(request.buddyRequestId, 'voice_complete', { durationMs: Date.now() - startedAt, audioBytes: audio.length });
     response.type('audio/mpeg');
-    return response.send(await synthesizeBuddyVoice(text.trim().slice(0, 2_000)));
+    return response.send(audio);
   } catch (error) {
     next(error);
   }
@@ -519,7 +617,11 @@ app.get(['/connect-vercel', '/api/connect-vercel'], async (_request, response, n
 app.use(express.static(interfaceRoot));
 app.use((error, _request, response, _next) => {
   const message = error instanceof Error ? error.message : 'Unexpected server error.';
-  response.status(500).json({ error: message });
+  trace(_request.buddyRequestId || 'unknown', 'request_error', {
+    path: _request.path,
+    error: message
+  });
+  response.status(/timed out|aborted|timeout/i.test(message) ? 504 : 500).json({ error: message });
 });
 
 if (!process.env.VERCEL) {

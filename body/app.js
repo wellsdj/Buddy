@@ -36,6 +36,34 @@ try {
   if (Array.isArray(savedConversation)) conversation = savedConversation.slice(-20);
 } catch (_) { /* start a fresh conversation if saved data is invalid */ }
 
+function newRequestId(prefix = 'web') {
+  return `${prefix}-${Date.now()}-${crypto.randomUUID?.() || Math.random().toString(36).slice(2)}`;
+}
+
+function clientLog(event, details = {}, requestId = newRequestId('log')) {
+  console.info('[Buddy]', event, { requestId, ...details });
+  fetch('/api/client-log', {
+    method: 'POST',
+    keepalive: true,
+    headers: { 'Content-Type': 'application/json', 'x-buddy-request-id': requestId },
+    body: JSON.stringify({ event, details })
+  }).catch(() => {});
+}
+
+async function fetchWithTimeout(url, options, timeoutMs, requestId) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms.`)), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: { ...(options?.headers || {}), ...(requestId ? { 'x-buddy-request-id': requestId } : {}) }
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function updateClock() {
   const now = new Date();
   clock.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
@@ -140,19 +168,23 @@ function startSpeechRecording() {
     if (audio.size < 1_000) return;
     transcribing = true;
     try {
-      const response = await fetch('/api/transcribe', {
+      const requestId = newRequestId('stt');
+      clientLog('transcription_start', { audioBytes: audio.size }, requestId);
+      const response = await fetchWithTimeout('/api/transcribe', {
         method: 'POST',
         headers: { 'Content-Type': audio.type || 'audio/webm' },
         body: audio
-      });
+      }, 25_000, requestId);
       const responseType = response.headers.get('content-type') || '';
       const data = responseType.includes('application/json')
         ? await response.json()
         : { error: `Transcription service returned ${response.status}.` };
       if (!response.ok) throw new Error(data.error || 'Groq transcription failed.');
+      clientLog('transcription_complete', { textLength: (data.text || '').length }, requestId);
       handleRecognizedSpeech(data.text || '');
     } catch (error) {
       console.warn('Groq speech recognition unavailable.', error);
+      clientLog('transcription_error', { error: error instanceof Error ? error.message : String(error) });
     } finally {
       transcribing = false;
     }
@@ -234,7 +266,10 @@ async function playNextSpeech() {
   orb.classList.remove('is-listening');
   orb.classList.add('is-speaking');
   stopSpeechRecording();
+  let finished = false;
   const finish = () => {
+    if (finished) return;
+    finished = true;
     speaking = false;
     currentAudio = undefined;
     orb.classList.remove('is-speaking');
@@ -243,16 +278,20 @@ async function playNextSpeech() {
     playNextSpeech();
   };
   try {
-    const response = await fetch('/api/voice', {
+    const requestId = newRequestId('voice');
+    clientLog('voice_start', { textLength: text.length }, requestId);
+    const response = await fetchWithTimeout('/api/voice', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text })
-    });
+    }, 25_000, requestId);
     if (!response.ok) throw new Error('ElevenLabs voice unavailable');
+    clientLog('voice_audio_ready', {}, requestId);
     currentAudio = new Audio(URL.createObjectURL(await response.blob()));
     await connectResponseMeter(currentAudio);
     currentAudio.onended = finish;
     currentAudio.onerror = finish;
     await currentAudio.play();
-  } catch (_) {
+  } catch (error) {
+    clientLog('voice_fallback', { error: error instanceof Error ? error.message : String(error) });
     if (!('speechSynthesis' in window)) return finish();
     const voice = new SpeechSynthesisUtterance(text);
     voice.rate = .94;
@@ -287,6 +326,15 @@ function actionAcknowledgement(request) {
   return 'Yep—I’m on it.';
 }
 
+function requestedActionCategory(request) {
+  if (/\b(email|e-mail|gmail)\b/i.test(request)) return 'gmail';
+  if (/\bspotify\b/i.test(request)) return 'spotify';
+  if (/\b(message|text)\b/i.test(request)) return 'messages';
+  if (/\b(github|repo|repository)\b/i.test(request)) return 'github';
+  if (/\b(vercel|deployment)\b/i.test(request)) return 'vercel';
+  return 'general';
+}
+
 function saveConversation(userMessage, assistantMessage) {
   conversation.push(
     { role: 'user', content: userMessage },
@@ -297,14 +345,33 @@ function saveConversation(userMessage, assistantMessage) {
 }
 
 async function requestBuddy(request, operation) {
-  const response = await fetch('/api/buddy', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ transcript: request, messages: conversation.slice(-20), operation })
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Buddy could not respond.');
-  return data;
+  const requestId = newRequestId('buddy');
+  const startedAt = performance.now();
+  clientLog('request_start', { operation: operation || 'reply', textLength: request.length }, requestId);
+  try {
+    const response = await fetchWithTimeout('/api/buddy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transcript: request, messages: conversation.slice(-20), operation })
+    }, 52_000, requestId);
+    const responseType = response.headers.get('content-type') || '';
+    const data = responseType.includes('application/json')
+      ? await response.json()
+      : { error: `Buddy returned ${response.status} instead of JSON.` };
+    clientLog(response.ok ? 'request_complete' : 'request_error', {
+      status: response.status,
+      durationMs: Math.round(performance.now() - startedAt),
+      error: response.ok ? undefined : data.error
+    }, requestId);
+    if (!response.ok) throw new Error(data.error || 'Buddy could not respond.');
+    return data;
+  } catch (error) {
+    clientLog('request_failed', {
+      durationMs: Math.round(performance.now() - startedAt),
+      error: error instanceof Error ? error.message : String(error)
+    }, requestId);
+    throw error;
+  }
 }
 
 function showArtifactEditor() {
@@ -411,16 +478,19 @@ async function runBackgroundAction(request) {
     activity: acknowledgement.replace(/^(yes|yep|sure)[—,\s]+/i, '').replace(/[.!]$/, '').toLowerCase()
   };
   backgroundJobs.set(job.id, job);
+  clientLog('background_job_started', { jobId: job.id, category: requestedActionCategory(request) });
   reply.querySelector('p').textContent = acknowledgement;
   say(acknowledgement, startRecognition);
   try {
     job.result = (await requestBuddy(request)).message;
     job.status = 'done';
+    clientLog('background_job_completed', { jobId: job.id });
     saveConversation(request, job.result);
   } catch (error) {
     console.warn('Buddy background action failed.', error);
     job.status = 'failed';
     job.result = error instanceof Error ? error.message : 'I couldn’t finish it.';
+    clientLog('background_job_failed', { jobId: job.id, error: job.result });
   }
   announceJobWhenFree(job);
 }
@@ -475,7 +545,11 @@ async function answer(request) {
   } catch (error) {
     console.warn('Buddy API unavailable.', error);
     orb.classList.remove('is-listening', 'is-speaking');
-    startRecognition();
+    const message = /timed out|abort/i.test(error instanceof Error ? error.message : '')
+      ? 'Sorry—that took too long, so I stopped it instead of leaving you waiting. Please try that once more.'
+      : 'Sorry—I hit a problem with that request. I’m still listening, so you can try again.';
+    reply.querySelector('p').textContent = message;
+    say(message, startRecognition);
   }
 }
 
