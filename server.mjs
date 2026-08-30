@@ -39,8 +39,10 @@ For Vercel, treat access as read-only: you may inspect projects, deployments, do
 Reply in one or two short spoken sentences unless the user asks for detail.`;
 
 function classifyRequest(transcript) {
+  const integration = /\b(spotify|gmail|e-?mail|inbox|message|text|github|repository|repo|vercel|deployment|calendar)\b/i;
   const coding = /\b(code|coding|program|programming|repository|repo|github|commit|pull request|debug|bug|function|class|html|css|javascript|typescript|python|node|npm|api endpoint|database|sql|deploy|build an? (?:app|website|feature))\b/i;
   const difficultReasoning = /\b(analy[sz]e deeply|reason|prove|derive|strategy|trade-?offs?|compare in depth|complex|difficult|hard problem|step by step|architecture|research|investigate)\b/i;
+  if (integration.test(transcript)) return 'tools';
   if (coding.test(transcript)) return 'coding';
   if (difficultReasoning.test(transcript) || transcript.length > 500) return 'reasoning';
   return 'simple';
@@ -92,9 +94,11 @@ async function replyToBuddy(transcript, messages) {
     : '';
   const system = buddySystemPrompt + localMessagesRules;
 
-  if (route === 'coding' || route === 'reasoning') {
+  if (route === 'tools' || route === 'coding' || route === 'reasoning') {
     if (!process.env.ANTHROPIC_API_KEY) throw new Error('Buddy needs its Claude key for this request.');
-    const modelId = route === 'coding'
+    const modelId = route === 'tools'
+      ? process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001'
+      : route === 'coding'
       ? process.env.ANTHROPIC_CODING_MODEL || 'claude-sonnet-5'
       : process.env.ANTHROPIC_REASONING_MODEL || 'claude-sonnet-5';
     const result = await generateBuddyReply({ model: anthropic(modelId), messages: conversation, tools, system });
