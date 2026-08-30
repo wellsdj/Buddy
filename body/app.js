@@ -129,7 +129,10 @@ function startSpeechRecording() {
         headers: { 'Content-Type': audio.type || 'audio/webm' },
         body: audio
       });
-      const data = await response.json();
+      const responseType = response.headers.get('content-type') || '';
+      const data = responseType.includes('application/json')
+        ? await response.json()
+        : { error: `Transcription service returned ${response.status}.` };
       if (!response.ok) throw new Error(data.error || 'Groq transcription failed.');
       handleRecognizedSpeech(data.text || '');
     } catch (error) {
