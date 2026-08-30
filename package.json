@@ -2,12 +2,16 @@
   "name": "buddy-desk-companion",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "node server.mjs",
     "start": "node server.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.0",
+    "@ai-sdk/groq": "^4.0.35",
     "@ai-sdk/mcp": "^1.0.76",
     "ai": "^6.0.0",
     "dotenv": "^16.0.0",

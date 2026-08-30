@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import express from 'express';
 import { generateText, stepCountIs, tool } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
+import { createGroq } from '@ai-sdk/groq';
 import { createMCPClient } from '@ai-sdk/mcp';
 import { z } from 'zod';
 
@@ -14,6 +15,7 @@ const interfaceRoot = path.join(root, 'body');
 if (!process.env.VERCEL) dotenv.config({ path: process.env.BUDDY_LOCAL_ENV_FILE || '.env.local' });
 const app = express();
 const anthropic = createAnthropic();
+const groq = createGroq();
 const runFile = promisify(execFile);
 let composioSession;
 let composioMcpClient;
@@ -26,21 +28,7 @@ const mockReplies = [
   'The quietest things are often doing the most work.',
   'I have filed that thought under: worth keeping.'
 ];
-async function replyToBuddy(transcript) {
-  if (process.env.BUDDY_AI_ENABLED !== 'true') {
-    return { message: mockReplies[Math.floor(Math.random() * mockReplies.length)], mode: 'mock' };
-  }
-  if (!process.env.ANTHROPIC_API_KEY) throw new Error('Buddy is missing its Claude API key.');
-
-  const requestId = ++buddyRequestId;
-  const composioTools = await getBuddyTools();
-  const messagesTools = process.platform === 'darwin' && !process.env.VERCEL
-    ? getMessagesTools(requestId)
-    : {};
-  const tools = { ...composioTools, ...messagesTools };
-  const result = await generateText({
-    model: anthropic(process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001'),
-    system: `You are Buddy, a warm, concise desk companion with Gmail, Spotify, GitHub, and Vercel tools${Object.keys(messagesTools).length ? ', plus local Apple Messages tools' : ''}.
+const buddySystemPrompt = `You are Buddy, a warm, concise desk companion with Gmail, Spotify, GitHub, and Vercel tools.
 Use tools only when the user asks for an action or current account information.
 When tools are needed, call COMPOSIO_SEARCH_TOOLS immediately without a spoken preamble,
 then execute the selected tool and report only the confirmed result.
@@ -48,16 +36,91 @@ Never claim an action succeeded unless its tool result confirms it.
 For email, create a draft by default; only send when the user clearly says to send.
 For GitHub, treat access as read-only: you may inspect repositories, files, commits, issues, pull requests, reviews, and comments, but never create, edit, merge, close, delete, or dispatch anything.
 For Vercel, treat access as read-only: you may inspect projects, deployments, domains, status, and logs, but never create, deploy, promote, redeploy, assign aliases, add or edit domains, change environment variables or settings, buy anything, or delete anything.
-For Apple Messages, always call PREPARE_MESSAGES_TEXT first and read the draft back.
-Never call SEND_PREPARED_MESSAGES_TEXT in the same request that prepared it.
-Only send a prepared message after the user separately says "send it" or clearly confirms sending.
-Reply in one or two short spoken sentences.`,
-    prompt: transcript,
+Reply in one or two short spoken sentences unless the user asks for detail.`;
+
+function classifyRequest(transcript) {
+  const coding = /\b(code|coding|program|programming|repository|repo|github|commit|pull request|debug|bug|function|class|html|css|javascript|typescript|python|node|npm|api endpoint|database|sql|deploy|build an? (?:app|website|feature))\b/i;
+  const difficultReasoning = /\b(analy[sz]e deeply|reason|prove|derive|strategy|trade-?offs?|compare in depth|complex|difficult|hard problem|step by step|architecture|research|investigate)\b/i;
+  if (coding.test(transcript)) return 'coding';
+  if (difficultReasoning.test(transcript) || transcript.length > 500) return 'reasoning';
+  return 'simple';
+}
+
+function normalizeConversation(messages, transcript) {
+  const history = Array.isArray(messages)
+    ? messages.slice(-20).flatMap((message) => {
+        if (!message || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string') return [];
+        const content = message.content.trim().slice(0, 2_000);
+        return content ? [{ role: message.role, content }] : [];
+      })
+    : [];
+  if (history.at(-1)?.role !== 'user' || history.at(-1)?.content !== transcript) {
+    history.push({ role: 'user', content: transcript });
+  }
+  return history.slice(-20);
+}
+
+async function generateBuddyReply({ model, messages, tools, system = buddySystemPrompt }) {
+  return generateText({
+    model,
+    system,
+    messages,
     maxOutputTokens: 800,
     tools,
     stopWhen: stepCountIs(6),
   });
-  return { message: result.text.trim(), mode: 'claude' };
+}
+
+async function replyToBuddy(transcript, messages) {
+  if (process.env.BUDDY_AI_ENABLED !== 'true') {
+    return { message: mockReplies[Math.floor(Math.random() * mockReplies.length)], mode: 'mock' };
+  }
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.GROQ_API_KEY) {
+    throw new Error('Buddy is missing its AI provider keys.');
+  }
+
+  const requestId = ++buddyRequestId;
+  const composioTools = await getBuddyTools();
+  const messagesTools = process.platform === 'darwin' && !process.env.VERCEL
+    ? getMessagesTools(requestId)
+    : {};
+  const tools = { ...composioTools, ...messagesTools };
+  const route = classifyRequest(transcript);
+  const conversation = normalizeConversation(messages, transcript);
+  const localMessagesRules = Object.keys(messagesTools).length
+    ? '\nFor Apple Messages, always prepare and read back the draft first. Send only after a separate explicit confirmation.'
+    : '';
+  const system = buddySystemPrompt + localMessagesRules;
+
+  if (route === 'coding' || route === 'reasoning') {
+    if (!process.env.ANTHROPIC_API_KEY) throw new Error('Buddy needs its Claude key for this request.');
+    const modelId = route === 'coding'
+      ? process.env.ANTHROPIC_CODING_MODEL || 'claude-sonnet-5'
+      : process.env.ANTHROPIC_REASONING_MODEL || 'claude-sonnet-5';
+    const result = await generateBuddyReply({ model: anthropic(modelId), messages: conversation, tools, system });
+    return { message: result.text.trim(), mode: 'claude', route, model: modelId };
+  }
+
+  if (process.env.GROQ_API_KEY) {
+    const modelIds = [
+      process.env.GROQ_PRIMARY_MODEL || 'qwen/qwen3.8-27b',
+      ...(process.env.GROQ_FALLBACK_MODELS || 'llama-3.3-70b-versatile,qwen/qwen3.6-27b')
+        .split(',').map((model) => model.trim()).filter(Boolean)
+    ];
+    for (const modelId of [...new Set(modelIds)]) {
+      try {
+        const result = await generateBuddyReply({ model: groq(modelId), messages: conversation, tools, system });
+        return { message: result.text.trim(), mode: 'groq', route, model: modelId };
+      } catch (error) {
+        console.warn(`Groq model ${modelId} unavailable; trying fallback.`, error instanceof Error ? error.message : error);
+      }
+    }
+  }
+
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error('Buddy could not reach an available AI model.');
+  const modelId = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
+  const result = await generateBuddyReply({ model: anthropic(modelId), messages: conversation, tools, system });
+  return { message: result.text.trim(), mode: 'claude', route, model: modelId };
 }
 
 const resolveContactScript = `
@@ -253,11 +316,11 @@ app.use((_request, response, next) => {
 
 app.post('/api/buddy', async (request, response, next) => {
   try {
-    const { transcript } = request.body || {};
+    const { transcript, messages } = request.body || {};
     if (typeof transcript !== 'string' || !transcript.trim()) {
       return response.status(400).json({ error: 'Buddy needs something to respond to.' });
     }
-    return response.json(await replyToBuddy(transcript.trim().slice(0, 2_000)));
+    return response.json(await replyToBuddy(transcript.trim().slice(0, 2_000), messages));
   } catch (error) {
     next(error);
   }

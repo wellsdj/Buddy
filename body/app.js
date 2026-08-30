@@ -20,6 +20,12 @@ const voiceToggle = document.querySelector('#voice-toggle');
 const wakePattern = /\b(?:hey|hi|hay)\s+(?:buddy|buddey|buddie|body)\b[,.]?\s*/i;
 const wakeReplies = ['Yes?', 'I’m here.', 'Ohh — I’m listening.', 'What’s up?'];
 let imageIndex = 0, busy = false, awake = false, recognition, voiceEnabled = true, speaking = false;
+const conversationStorageKey = 'buddy-conversation-v1';
+let conversation = [];
+try {
+  const savedConversation = JSON.parse(localStorage.getItem(conversationStorageKey) || '[]');
+  if (Array.isArray(savedConversation)) conversation = savedConversation.slice(-20);
+} catch (_) { /* start a fresh conversation if saved data is invalid */ }
 
 function updateClock() {
   const now = new Date();
@@ -80,11 +86,17 @@ async function answer(request) {
     const response = await fetch('/api/buddy', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript: request })
+      body: JSON.stringify({ transcript: request, messages: conversation.slice(-20) })
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Buddy could not respond.');
     message = data.message;
+    conversation.push(
+      { role: 'user', content: request },
+      { role: 'assistant', content: message }
+    );
+    if (conversation.length > 20) conversation.splice(0, conversation.length - 20);
+    localStorage.setItem(conversationStorageKey, JSON.stringify(conversation));
   } catch (error) {
     console.warn('Buddy API unavailable; using local reply.', error);
   }
