@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import express from 'express';
-import { generateText, stepCountIs, tool } from 'ai';
+import { generateText, Output, stepCountIs, tool } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGroq } from '@ai-sdk/groq';
 import { createMCPClient } from '@ai-sdk/mcp';
@@ -87,6 +87,36 @@ async function summarizeToolOutcome(transcript, result) {
     maxOutputTokens: 160
   });
   return cleanBuddyReply(summary.text);
+}
+
+async function composeEmailDraft(transcript, messages) {
+  if (!process.env.GROQ_API_KEY) throw new Error('Buddy is missing its Groq API key.');
+  const conversation = normalizeConversation(messages, transcript);
+  const result = await generateText({
+    model: groq(process.env.GROQ_FAST_MODEL || 'openai/gpt-oss-20b'),
+    system: `You prepare polished email drafts for the user. Infer details from recent conversation when they are clear.
+Never invent an email address. If the recipient or essential purpose is genuinely unclear, put one short friendly question in clarification.
+Otherwise return the intended recipient exactly as supplied, a useful subject, and a natural email body. Do not send or create anything.`,
+    messages: conversation,
+    output: Output.object({ schema: z.object({
+      recipient: z.string(),
+      subject: z.string(),
+      body: z.string(),
+      clarification: z.string()
+    }) }),
+    maxOutputTokens: 700
+  });
+  const draft = result.output;
+  if (draft.clarification.trim()) return { message: draft.clarification.trim() };
+  return {
+    message: 'I’ve written that. You can ask me to show it, change it, or create the Gmail draft.',
+    draft: {
+      type: 'email',
+      recipient: draft.recipient.trim(),
+      subject: draft.subject.trim(),
+      body: draft.body.replace(/\[your name\]/gi, 'Wells').trim()
+    }
+  };
 }
 
 async function replyToBuddy(transcript, messages) {
@@ -243,7 +273,11 @@ async function synthesizeBuddyVoice(text) {
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'xi-api-key': process.env.ELEVENLABS_API_KEY },
-      body: JSON.stringify({ text, model_id: 'eleven_flash_v2_5' })
+      body: JSON.stringify({
+        text,
+        model_id: process.env.ELEVENLABS_MODEL || 'eleven_v3_conversational',
+        voice_settings: { stability: .52, similarity_boost: .82, style: .22, use_speaker_boost: true }
+      })
     }
   );
   if (!response.ok) throw new Error('ElevenLabs could not create Buddy’s voice response.');
@@ -441,11 +475,13 @@ app.post('/api/transcribe', express.raw({ type: ['audio/webm', 'audio/ogg', 'aud
 
 app.post('/api/buddy', async (request, response, next) => {
   try {
-    const { transcript, messages } = request.body || {};
+    const { transcript, messages, operation } = request.body || {};
     if (typeof transcript !== 'string' || !transcript.trim()) {
       return response.status(400).json({ error: 'Buddy needs something to respond to.' });
     }
-    return response.json(await replyToBuddy(transcript.trim().slice(0, 2_000), messages));
+    const cleanTranscript = transcript.trim().slice(0, 2_000);
+    if (operation === 'compose_email') return response.json(await composeEmailDraft(cleanTranscript, messages));
+    return response.json(await replyToBuddy(cleanTranscript, messages));
   } catch (error) {
     next(error);
   }

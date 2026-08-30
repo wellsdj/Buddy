@@ -33,6 +33,21 @@
         <button class="voice-toggle" id="voice-toggle" type="button" aria-pressed="true">Voice on</button>
       </section>
     </main>
+    <dialog class="editor" id="artifact-editor" aria-labelledby="editor-title">
+      <form method="dialog" class="editor-card">
+        <div class="editor-heading">
+          <div><p>Buddy draft</p><h2 id="editor-title">Edit email</h2></div>
+          <button class="editor-close" value="cancel" aria-label="Close editor">×</button>
+        </div>
+        <label>To<input id="editor-recipient" autocomplete="off" /></label>
+        <label>Subject<input id="editor-subject" autocomplete="off" /></label>
+        <label>Message<textarea id="editor-body" rows="12"></textarea></label>
+        <div class="editor-actions">
+          <button class="editor-cancel" value="cancel">Cancel</button>
+          <button class="editor-ok" id="editor-ok" value="default">OK, use this text</button>
+        </div>
+      </form>
+    </dialog>
     <script src="app.js"></script>
   </body>
 </html>

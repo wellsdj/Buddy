@@ -23,5 +23,19 @@ body { margin: 0; min-height: 100vh; display: grid; place-items: center; overflo
 .notes { color: #d6dceb; text-align: center; }.notes p { margin: 0 0 9px; color: #9ba9bf; font: 500 10px 'DM Mono'; letter-spacing: .1em; text-transform: uppercase; }.notes h1 { margin: 0 0 17px; font-size: 21px; font-weight: 500; line-height: 1.35; }.notes em { font-style: normal; color: #c0ffda; }
 .voice-toggle { margin-top: 18px; padding: 8px 12px; border: 1px solid #9eacc550; border-radius: 999px; background: #15233bb5; color: #dce8ff; font: 500 10px 'DM Mono'; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; }
 .voice-toggle:hover { border-color: #b8ffd1; color: #b8ffd1; }
+.editor { width: min(92vw, 650px); padding: 0; border: 1px solid #ffffff24; border-radius: 24px; color: #eef4ff; background: #111827f5; box-shadow: 0 32px 100px #000c; }
+.editor::backdrop { background: #02040bb8; backdrop-filter: blur(12px); }
+.editor-card { display: grid; gap: 16px; padding: 24px; }
+.editor-heading { display: flex; justify-content: space-between; align-items: start; }
+.editor-heading p { margin: 0 0 4px; color: #9fb0ca; font: 500 10px 'DM Mono'; letter-spacing: .12em; text-transform: uppercase; }
+.editor-heading h2 { margin: 0; font-size: 22px; }
+.editor-close { border: 0; background: transparent; color: #aebbd0; font-size: 28px; cursor: pointer; }
+.editor label { display: grid; gap: 7px; color: #acbad0; font: 500 10px 'DM Mono'; letter-spacing: .08em; text-transform: uppercase; }
+.editor input, .editor textarea { width: 100%; border: 1px solid #ffffff20; border-radius: 12px; padding: 12px 14px; background: #202b3d; color: white; font: 500 14px/1.5 Manrope; outline: none; resize: vertical; }
+.editor input:focus, .editor textarea:focus { border-color: #9cbfff; box-shadow: 0 0 0 3px #7898ff20; }
+.editor-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.editor-actions button { border-radius: 999px; padding: 10px 16px; font: 600 12px Manrope; cursor: pointer; }
+.editor-cancel { border: 1px solid #ffffff22; background: transparent; color: #b8c4d7; }
+.editor-ok { border: 0; background: linear-gradient(110deg, #ff91a6, #9c9cff 52%, #73cfff); color: #07101d; }
 @keyframes breathe { to { transform: scale(1.1); } }
 @media (min-width: 880px) { .stage { grid-template-columns: 610px auto; }.notes { text-align: left; }.notes h1 { font-size: 28px; } }

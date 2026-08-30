@@ -14,6 +14,11 @@ const reply = document.querySelector('#reply');
 const voiceRing = document.querySelector('#voice-ring');
 const ringContext = voiceRing.getContext('2d');
 const voiceToggle = document.querySelector('#voice-toggle');
+const artifactEditor = document.querySelector('#artifact-editor');
+const editorRecipient = document.querySelector('#editor-recipient');
+const editorSubject = document.querySelector('#editor-subject');
+const editorBody = document.querySelector('#editor-body');
+const editorOk = document.querySelector('#editor-ok');
 const wakePattern = /\b(?:hey|hi|hay)\s+(?:buddy|buddey|buddie|body)\b[,.]?\s*/i;
 let imageIndex = 0, awake = false, voiceEnabled = true, speaking = false;
 let audioContext, micAnalyser, micStream, activeAnalyser, ringFrame, mediaRecorder;
@@ -22,6 +27,7 @@ let voiceColorPhase = 0;
 let currentAudio, lastUserActivity = Date.now(), nextJobId = 1;
 const speechQueue = [];
 const backgroundJobs = new Map();
+let pendingArtifact;
 const conversationStorageKey = 'buddy-conversation-v1';
 let conversation = [];
 try {
@@ -122,7 +128,7 @@ function recorderMimeType() {
 }
 
 function startSpeechRecording() {
-  if (!micStream || mediaRecorder?.state === 'recording' || recordingStopping || speaking || transcribing) return;
+  if (!micStream || artifactEditor.open || mediaRecorder?.state === 'recording' || recordingStopping || speaking || transcribing) return;
   const chunks = [];
   mediaRecorder = new MediaRecorder(micStream, recorderMimeType() ? { mimeType: recorderMimeType() } : undefined);
   mediaRecorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
@@ -163,7 +169,7 @@ function stopSpeechRecording() {
 }
 
 function monitorVoiceActivity(time = 0) {
-  if (voiceEnabled && !speaking && micAnalyser) {
+  if (voiceEnabled && !artifactEditor.open && !speaking && micAnalyser) {
     const samples = new Uint8Array(micAnalyser.fftSize);
     micAnalyser.getByteTimeDomainData(samples);
     let energy = 0;
@@ -289,15 +295,83 @@ function saveConversation(userMessage, assistantMessage) {
   localStorage.setItem(conversationStorageKey, JSON.stringify(conversation));
 }
 
-async function requestBuddy(request) {
+async function requestBuddy(request, operation) {
   const response = await fetch('/api/buddy', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ transcript: request, messages: conversation.slice(-20) })
+    body: JSON.stringify({ transcript: request, messages: conversation.slice(-20), operation })
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Buddy could not respond.');
-  return data.message;
+  return data;
+}
+
+function showArtifactEditor() {
+  if (!pendingArtifact) return;
+  stopSpeechRecording();
+  editorRecipient.value = pendingArtifact.recipient || '';
+  editorSubject.value = pendingArtifact.subject || '';
+  editorBody.value = pendingArtifact.body || '';
+  artifactEditor.showModal();
+  setTimeout(() => editorBody.focus(), 50);
+}
+
+artifactEditor.addEventListener('close', () => startRecognition());
+
+editorOk.addEventListener('click', event => {
+  event.preventDefault();
+  if (!pendingArtifact) return artifactEditor.close();
+  pendingArtifact = {
+    ...pendingArtifact,
+    recipient: editorRecipient.value.trim(),
+    subject: editorSubject.value.trim(),
+    body: editorBody.value.trim(),
+    reviewed: true
+  };
+  artifactEditor.close();
+  const message = 'Got it—I’ll use exactly that text. Shall I create the Gmail draft, or send it?';
+  reply.querySelector('p').textContent = message;
+  say(message, startRecognition);
+});
+
+function isEmailComposition(request) {
+  return /\b(email|e-mail|gmail)\b/i.test(request)
+    && (/\b(write|draft|compose|send|reply|forward)\b/i.test(request) || /^email\b/i.test(request));
+}
+
+async function prepareEmailArtifact(request) {
+  const acknowledgement = 'Of course—I’ll write it first so you can check it.';
+  reply.querySelector('p').textContent = acknowledgement;
+  say(acknowledgement, startRecognition);
+  try {
+    const data = await requestBuddy(request, 'compose_email');
+    if (data.draft) pendingArtifact = { ...data.draft, originalRequest: request, reviewed: false };
+    saveConversation(request, data.message);
+    reply.querySelector('p').textContent = data.message;
+    say(data.message, startRecognition);
+  } catch (error) {
+    console.warn('Buddy could not prepare the email.', error);
+    say('I couldn’t prepare that email just now. Please try again.', startRecognition);
+  }
+}
+
+function executePendingEmail(send) {
+  if (!pendingArtifact) return;
+  if (!pendingArtifact.recipient.includes('@')) {
+    const message = `I still need ${pendingArtifact.recipient || 'the recipient'}’s email address. Add it in the To field and press OK.`;
+    reply.querySelector('p').textContent = message;
+    say(message, showArtifactEditor);
+    return;
+  }
+  if (send && !pendingArtifact.reviewed) {
+    const message = 'Let me show it to you before I send anything.';
+    reply.querySelector('p').textContent = message;
+    say(message, showArtifactEditor);
+    return;
+  }
+  const action = send ? 'Send this email now' : 'Create this Gmail draft without sending it';
+  const exactRequest = `${action}. Use this exact content. To: ${pendingArtifact.recipient}. Subject: ${pendingArtifact.subject}. Body: ${pendingArtifact.body}`;
+  runBackgroundAction(exactRequest);
 }
 
 function latestJobStatusReply() {
@@ -334,7 +408,7 @@ async function runBackgroundAction(request) {
   reply.querySelector('p').textContent = acknowledgement;
   say(acknowledgement, startRecognition);
   try {
-    job.result = await requestBuddy(request);
+    job.result = (await requestBuddy(request)).message;
     job.status = 'done';
     saveConversation(request, job.result);
   } catch (error) {
@@ -346,6 +420,23 @@ async function runBackgroundAction(request) {
 }
 
 async function answer(request) {
+  if (pendingArtifact && /\b(show|display|open|edit|change|correct|fix)\b.*\b(it|email|draft|text)\b|\b(show|display|edit) (?:the )?(?:email|draft)\b/i.test(request)) {
+    showArtifactEditor();
+    return;
+  }
+  if (pendingArtifact && /\b(send it|send the email|send that)\b/i.test(request)) {
+    executePendingEmail(true);
+    return;
+  }
+  if (pendingArtifact && (/\b(create|save|make)\b.*\b(draft|email)\b/i.test(request)
+    || /^(yes|okay|ok|confirm)(?:[.!])?$/i.test(request.trim()))) {
+    executePendingEmail(false);
+    return;
+  }
+  if (isEmailComposition(request)) {
+    prepareEmailArtifact(request);
+    return;
+  }
   if (/\b(is it done|are you done|finished yet|how is that going|what's the status|what is the status)\b/i.test(request)) {
     const status = latestJobStatusReply();
     if (status) {
@@ -359,7 +450,7 @@ async function answer(request) {
     return;
   }
   try {
-    const message = await requestBuddy(request);
+    const message = (await requestBuddy(request)).message;
     saveConversation(request, message);
     reply.querySelector('p').textContent = message;
     orb.classList.remove('is-listening');
