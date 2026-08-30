@@ -4,13 +4,6 @@ const images = [
   'assets/alpine-dawn.png', 'assets/coastal-sunset.png', 'assets/forest-waterfall.png',
   'assets/desert-moonrise.png'
 ];
-const replies = [
-  'The room feels like it is waiting for a good idea.',
-  'A tiny note from tomorrow: you are closer than you think.',
-  'I would put the kettle on, if I had hands.',
-  'The quietest things are often doing the most work.',
-  'I have filed that thought under: worth keeping.'
-];
 const orb = document.querySelector('.orb');
 const scenery = document.querySelector('.scenery');
 const clock = document.querySelector('#clock');
@@ -22,9 +15,9 @@ const voiceRing = document.querySelector('#voice-ring');
 const ringContext = voiceRing.getContext('2d');
 const voiceToggle = document.querySelector('#voice-toggle');
 const wakePattern = /\b(?:hey|hi|hay)\s+(?:buddy|buddey|buddie|body)\b[,.]?\s*/i;
-const wakeReplies = ['Yes?', 'I’m here.', 'Ohh — I’m listening.', 'What’s up?'];
-let imageIndex = 0, busy = false, awake = false, recognition, voiceEnabled = true, speaking = false;
-let audioContext, micAnalyser, micStream, activeAnalyser, ringFrame;
+let imageIndex = 0, busy = false, awake = false, voiceEnabled = true, speaking = false;
+let audioContext, micAnalyser, micStream, activeAnalyser, ringFrame, mediaRecorder;
+let voiceMonitorFrame, speechStartedAt = 0, silenceStartedAt = 0, transcribing = false, recordingStopping = false;
 const conversationStorageKey = 'buddy-conversation-v1';
 let conversation = [];
 try {
@@ -114,6 +107,86 @@ async function startMicMeter() {
   } catch (_) { activeAnalyser = undefined; }
 }
 
+function recorderMimeType() {
+  return ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+    .find(type => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function startSpeechRecording() {
+  if (!micStream || mediaRecorder?.state === 'recording' || recordingStopping || busy || speaking || transcribing) return;
+  const chunks = [];
+  mediaRecorder = new MediaRecorder(micStream, recorderMimeType() ? { mimeType: recorderMimeType() } : undefined);
+  mediaRecorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
+  mediaRecorder.onstop = async () => {
+    recordingStopping = false;
+    if (!chunks.length || busy || speaking || !voiceEnabled) return;
+    const audio = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+    if (audio.size < 1_000) return;
+    transcribing = true;
+    try {
+      const response = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': audio.type || 'audio/webm' },
+        body: audio
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Groq transcription failed.');
+      handleRecognizedSpeech(data.text || '');
+    } catch (error) {
+      console.warn('Groq speech recognition unavailable.', error);
+    } finally {
+      transcribing = false;
+    }
+  };
+  speechStartedAt = performance.now();
+  silenceStartedAt = 0;
+  mediaRecorder.start();
+}
+
+function stopSpeechRecording() {
+  if (mediaRecorder?.state === 'recording') {
+    recordingStopping = true;
+    mediaRecorder.stop();
+  }
+}
+
+function monitorVoiceActivity(time = 0) {
+  if (voiceEnabled && !busy && !speaking && micAnalyser) {
+    const samples = new Uint8Array(micAnalyser.fftSize);
+    micAnalyser.getByteTimeDomainData(samples);
+    let energy = 0;
+    for (const sample of samples) energy += Math.pow((sample - 128) / 128, 2);
+    const volume = Math.sqrt(energy / samples.length);
+    if (volume > .028) {
+      silenceStartedAt = 0;
+      startSpeechRecording();
+    } else if (mediaRecorder?.state === 'recording') {
+      silenceStartedAt ||= time;
+      const speechLength = time - speechStartedAt;
+      if ((speechLength > 650 && time - silenceStartedAt > 850) || speechLength > 12_000) stopSpeechRecording();
+    }
+  }
+  voiceMonitorFrame = requestAnimationFrame(monitorVoiceActivity);
+}
+
+function handleRecognizedSpeech(words) {
+  const cleanWords = words.trim();
+  if (!cleanWords || busy || speaking) return;
+  const wakeMatch = cleanWords.match(wakePattern);
+  if (!awake && wakeMatch) {
+    awake = true;
+    orb.classList.add('is-listening');
+    const request = cleanWords.slice((wakeMatch.index || 0) + wakeMatch[0].length).trim();
+    if (request) answer(request);
+    else acknowledgeWake();
+    return;
+  }
+  if (awake) {
+    const request = cleanWords.replace(wakePattern, '').trim();
+    if (request) answer(request);
+  }
+}
+
 async function connectResponseMeter(audio) {
   try {
     audioContext ||= new AudioContext();
@@ -132,7 +205,7 @@ async function say(text, onend) {
   speaking = true;
   orb.classList.remove('is-listening');
   orb.classList.add('is-speaking');
-  recognition?.stop();
+  stopSpeechRecording();
   const finish = () => {
     speaking = false;
     orb.classList.remove('is-speaking');
@@ -161,7 +234,7 @@ async function say(text, onend) {
 }
 
 function acknowledgeWake() {
-  const message = wakeReplies[Math.floor(Math.random() * wakeReplies.length)];
+  const message = 'I’m here.';
   showTranscript('I’m listening…');
   reply.querySelector('p').textContent = message;
   say(message, () => { if (voiceEnabled && !busy) startRecognition(); });
@@ -170,7 +243,6 @@ function acknowledgeWake() {
 async function answer(request) {
   if (busy) return;
   busy = true;
-  let message = replies[Math.floor(Math.random() * replies.length)];
   try {
     const response = await fetch('/api/buddy', {
       method: 'POST',
@@ -179,19 +251,22 @@ async function answer(request) {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Buddy could not respond.');
-    message = data.message;
+    const message = data.message;
     conversation.push(
       { role: 'user', content: request },
       { role: 'assistant', content: message }
     );
     if (conversation.length > 20) conversation.splice(0, conversation.length - 20);
     localStorage.setItem(conversationStorageKey, JSON.stringify(conversation));
+    reply.querySelector('p').textContent = message;
+    orb.classList.remove('is-listening');
+    say(message, resetVoice);
   } catch (error) {
-    console.warn('Buddy API unavailable; using local reply.', error);
+    console.warn('Buddy API unavailable.', error);
+    busy = false;
+    orb.classList.remove('is-listening', 'is-speaking');
+    startRecognition();
   }
-  reply.querySelector('p').textContent = message;
-  orb.classList.remove('is-listening');
-  say(message, resetVoice);
 }
 
 function resetVoice() {
@@ -200,58 +275,15 @@ function resetVoice() {
   setTimeout(startRecognition, 350);
 }
 
-function startRecognition() {
-  if (!recognition || busy || !voiceEnabled || speaking) return;
+async function startRecognition() {
+  if (busy || !voiceEnabled || speaking) return;
+  await startMicMeter();
   if (awake) {
     orb.classList.add('is-listening');
-    startMicMeter();
   }
-  try { recognition.start(); } catch (_) { /* already listening */ }
 }
-
-if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  recognition = new Recognition();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = navigator.language || 'en-US';
-  recognition.onresult = event => {
-    if (busy) return;
-    let words = '';
-    let final = false;
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      words += event.results[i][0].transcript;
-      final ||= event.results[i].isFinal;
-    }
-    const wakeMatch = words.match(wakePattern);
-    if (!awake && wakeMatch) {
-      awake = true;
-      orb.classList.add('is-listening');
-      startMicMeter();
-      const request = words.slice((wakeMatch.index || 0) + wakeMatch[0].length).trim();
-      if (final && request) {
-        showTranscript(request);
-        setTimeout(() => answer(request), 550);
-      } else if (final) {
-        acknowledgeWake();
-      }
-      return;
-    }
-    if (awake && words.trim()) {
-      const request = words.replace(wakePattern, '').trim();
-      if (!request) return;
-      showTranscript(request);
-      if (final) setTimeout(() => answer(request), 550);
-    }
-  };
-  recognition.onend = () => { if (!busy && voiceEnabled && !speaking) setTimeout(startRecognition, 300); };
-  recognition.onerror = event => {
-    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') return;
-    if (!busy) setTimeout(startRecognition, 800);
-  };
-  startRecognition();
-  orb.addEventListener('click', startRecognition);
-}
+startRecognition();
+orb.addEventListener('click', startRecognition);
 voiceToggle.addEventListener('click', () => {
   voiceEnabled = !voiceEnabled;
   voiceToggle.textContent = voiceEnabled ? 'Voice on' : 'Voice off';
@@ -262,7 +294,11 @@ voiceToggle.addEventListener('click', () => {
     awake = false;
     busy = false;
     orb.classList.remove('is-listening', 'is-speaking');
-    recognition?.stop();
+    stopSpeechRecording();
+    micStream?.getTracks().forEach(track => track.stop());
+    micStream = undefined;
+    micAnalyser = undefined;
+    activeAnalyser = undefined;
     window.speechSynthesis?.cancel();
     speaking = false;
     reply.querySelector('p').textContent = 'Voice is off — no requests will be sent.';
@@ -270,5 +306,6 @@ voiceToggle.addEventListener('click', () => {
 });
 updateClock();
 drawVoiceRing();
+monitorVoiceActivity();
 setInterval(updateClock, 1000);
 setInterval(nextScene, 180000);

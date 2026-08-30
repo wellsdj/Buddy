@@ -1,13 +1,11 @@
 # Buddy
 
-A visual prototype for a circular, voice-first desk companion. It shows a live clock over rotating natural scenery and uses Chrome speech recognition to wake when you say “hey buddy,” display what it heard, and speak a placeholder response.
+A circular, voice-first desk companion. It shows a live clock over rotating natural scenery, uses Groq Whisper transcription to wake when you say “hey buddy,” and speaks real Buddy responses without displaying conversation text.
 
 ## Run it
 
-Open `index.html` in a browser, or serve this directory with any static HTTP server. Backgrounds rotate every ten minutes. The response is intentionally local and random for this prototype; no AI key is used or stored.
+Run the repository server with `npm run dev`, then open `http://127.0.0.1:4173`. Backgrounds rotate every three minutes. API keys remain server-side.
 
 ## Next steps
 
-- Add a secure server-side Claude API proxy (never put an API key in the browser).
-- Connect a real wake-word / speech-to-text pipeline.
-- Add skills and permissioned desktop actions.
+- Add more permissioned skills and desktop actions.

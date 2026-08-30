@@ -21,13 +21,6 @@ const composioSessions = new Map();
 const composioMcpClients = new Map();
 let pendingMessage;
 let buddyRequestId = 0;
-const mockReplies = [
-  'The room feels like it is waiting for a good idea.',
-  'A tiny note from tomorrow: you are closer than you think.',
-  'I would put the kettle on, if I had hands.',
-  'The quietest things are often doing the most work.',
-  'I have filed that thought under: worth keeping.'
-];
 const buddySystemPrompt = `You are Buddy, a warm, concise desk companion with Gmail, Spotify, GitHub, and Vercel tools.
 Use tools only when the user asks for an action or current account information.
 When tools are needed, call the relevant app tool immediately without a spoken preamble and report only the confirmed result.
@@ -81,7 +74,7 @@ function cleanBuddyReply(text) {
 
 async function replyToBuddy(transcript, messages) {
   if (process.env.BUDDY_AI_ENABLED !== 'true') {
-    return { message: mockReplies[Math.floor(Math.random() * mockReplies.length)], mode: 'mock' };
+    throw new Error('Buddy AI is turned off.');
   }
   if (!process.env.ANTHROPIC_API_KEY && !process.env.GROQ_API_KEY) {
     throw new Error('Buddy is missing its AI provider keys.');
@@ -364,6 +357,34 @@ app.use(express.json({ limit: '8kb' }));
 app.use((_request, response, next) => {
   response.set('Cache-Control', 'no-store');
   next();
+});
+
+app.post('/api/transcribe', express.raw({ type: ['audio/webm', 'audio/ogg', 'audio/mp4'], limit: '12mb' }), async (request, response, next) => {
+  try {
+    if (!process.env.GROQ_API_KEY) throw new Error('Buddy is missing its Groq API key.');
+    if (!Buffer.isBuffer(request.body) || !request.body.length) {
+      return response.status(400).json({ error: 'Buddy needs recorded audio to transcribe.' });
+    }
+    const mimeType = request.get('content-type')?.split(';')[0] || 'audio/webm';
+    const extension = mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mp4') ? 'm4a' : 'webm';
+    const form = new FormData();
+    form.append('file', new Blob([request.body], { type: mimeType }), `buddy-speech.${extension}`);
+    form.append('model', process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo');
+    form.append('language', 'en');
+    form.append('response_format', 'json');
+    form.append('temperature', '0');
+    form.append('prompt', 'The assistant wake phrase is Hey Buddy. Transcribe names and app names such as Spotify and Gmail accurately.');
+    const transcription = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: form
+    });
+    const data = await transcription.json();
+    if (!transcription.ok) throw new Error(data.error?.message || 'Groq could not transcribe Buddy’s audio.');
+    return response.json({ text: typeof data.text === 'string' ? data.text.trim() : '' });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/buddy', async (request, response, next) => {
