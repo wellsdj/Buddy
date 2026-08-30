@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101827" />
+    <title>Buddy — your desk companion</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="stage">
+      <section class="orb" aria-label="Buddy desk companion">
+        <div class="scenery" aria-hidden="true"></div>
+        <div class="veil" aria-hidden="true"></div>
+        <div class="grain" aria-hidden="true"></div>
+        <div class="topline"><span id="date"></span></div>
+        <div class="clock-wrap">
+          <div id="clock" class="clock">12:48</div>
+          <p id="greeting">good afternoon, wells</p>
+        </div>
+        <div class="listening" aria-live="polite">
+          <div class="wave"><i></i><i></i><i></i><i></i><i></i></div>
+        </div>
+        <div class="transcript" id="transcript" aria-live="polite"><span>You</span><p></p></div>
+        <div class="reply" id="reply" aria-live="polite"><span>Buddy</span><p></p></div>
+        <div class="screen-rim" aria-hidden="true"></div>
+      </section>
+      <section class="notes">
+        <p>Desk Buddy / prototype</p>
+        <h1>A calm little presence<br />for your desk.</h1>
+        <p>Always ready when you say <em>“hey buddy”</em>.</p>
+        <button class="voice-toggle" id="voice-toggle" type="button" aria-pressed="true">Voice on</button>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/*.mjs": {
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    { "source": "/", "destination": "/body/index.html" },
+    { "source": "/connect-gmail", "destination": "/api/connect-gmail" },
+    { "source": "/connect-spotify", "destination": "/api/connect-spotify" },
+    { "source": "/connect-github", "destination": "/api/connect-github" },
+    { "source": "/connect-vercel", "destination": "/api/connect-vercel" },
+    { "source": "/style.css", "destination": "/body/style.css" },
+    { "source": "/app.js", "destination": "/body/app.js" },
+    { "source": "/assets/:path*", "destination": "/body/assets/:path*" }
+  ]
+}

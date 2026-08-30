@@ -1,0 +1,30 @@
+:root { color-scheme: dark; font-family: Manrope, sans-serif; background: #10131d; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; overflow: hidden; background: radial-gradient(circle at 51% 42%, #30455b 0, #171e2d 25%, #0b0d13 72%); }
+.stage { min-height: 100vh; width: min(100%, 1100px); display: grid; place-items: center; gap: 48px; padding: 50px 24px; }
+.orb { width: min(78vw, 610px); aspect-ratio: 1; border-radius: 50%; position: relative; overflow: hidden; isolation: isolate; box-shadow: 0 48px 110px #000a, 0 0 0 2px #fff3, inset 0 0 0 2px #0008; background: #1a2030; }
+.scenery, .veil, .grain { position: absolute; inset: 0; }
+.scenery { background: center/cover url('assets/starfield-lavender.png'); transition: opacity 1.8s ease, background-image 0s; transform: scale(1.03); animation: breathe 14s ease-in-out infinite alternate; }
+.veil { background: linear-gradient(180deg, #07111b3b, #05070c25 38%, #030510b8); z-index: 1; }
+.grain { z-index: 2; opacity: .12; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.4'/%3E%3C/svg%3E"); mix-blend-mode: soft-light; pointer-events: none; }
+.topline, .clock-wrap, .listening, .transcript, .reply { position: absolute; z-index: 3; }
+.topline { top: 15%; left: 22%; right: 22%; display: flex; align-items: center; justify-content: center; color: #ffffffe0; font: 500 10px/1 'DM Mono', monospace; letter-spacing: .13em; text-transform: uppercase; }
+.topline #date { opacity: .8; }
+.clock-wrap { top: 47%; left: 50%; width: 90%; transform: translate(-50%, -50%); text-align: center; color: white; text-shadow: 0 3px 24px #000a; }
+.clock { font-size: clamp(66px, 15vw, 130px); letter-spacing: -.09em; font-weight: 500; line-height: .82; margin-left: -.08em; }
+.clock-wrap p { margin: 19px 0 0; font: 500 clamp(11px, 1.8vw, 14px)/1 'DM Mono', monospace; letter-spacing: .05em; opacity: .85; }
+.listening { bottom: 12%; left: 50%; transform: translateX(-50%); text-align: center; color: #fff; width: 180px; transition: .4s ease; }
+.wave { height: 22px; display: flex; align-items: center; justify-content: center; gap: 4px; }
+.wave i { width: 2px; height: 5px; background: #fff; border-radius: 9px; opacity: .8; animation: wave 1.25s ease-in-out infinite; }
+.wave i:nth-child(2) { animation-delay: .13s }.wave i:nth-child(3) { animation-delay: .26s }.wave i:nth-child(4) { animation-delay: .39s }.wave i:nth-child(5) { animation-delay: .52s }
+.transcript, .reply { left: 50%; top: 62%; transform: translate(-50%, 10px); width: min(76%, 360px); padding: 13px 16px; border: 1px solid #fff2; border-radius: 15px; background: #0b122580; backdrop-filter: blur(18px); color: #fff; opacity: 0; transition: .4s; text-align: center; pointer-events: none; }
+.transcript.show, .reply.show { opacity: 1; transform: translate(-50%, 0); }
+.transcript span, .reply span { color: #b8ffd1; font: 500 9px 'DM Mono'; letter-spacing: .12em; text-transform: uppercase; }
+.transcript p, .reply p { font-size: 12px; line-height: 1.45; margin: 5px 0 0; }
+.screen-rim { position: absolute; inset: 0; z-index: 4; pointer-events: none; border-radius: 50%; box-shadow: inset 0 0 32px #0008, inset 0 0 2px 3px #fff3; }
+.notes { color: #d6dceb; text-align: center; }.notes p { margin: 0 0 9px; color: #9ba9bf; font: 500 10px 'DM Mono'; letter-spacing: .1em; text-transform: uppercase; }.notes h1 { margin: 0 0 17px; font-size: 21px; font-weight: 500; line-height: 1.35; }.notes em { font-style: normal; color: #c0ffda; }
+.orb.is-listening .wave i { animation-duration: .55s; background: #d5ffe3; box-shadow: 0 0 12px #b8ffd1; }
+.voice-toggle { margin-top: 18px; padding: 8px 12px; border: 1px solid #9eacc550; border-radius: 999px; background: #15233bb5; color: #dce8ff; font: 500 10px 'DM Mono'; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; }
+.voice-toggle:hover { border-color: #b8ffd1; color: #b8ffd1; }
+@keyframes wave { 50% { height: 21px; opacity: 1; } } @keyframes breathe { to { transform: scale(1.1); } }
+@media (min-width: 880px) { .stage { grid-template-columns: 610px auto; }.notes { text-align: left; }.notes h1 { font-size: 28px; } }
