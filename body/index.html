@@ -21,11 +21,9 @@
           <div id="clock" class="clock">12:48</div>
           <p id="greeting">good afternoon, wells</p>
         </div>
-        <div class="listening" aria-live="polite">
-          <div class="wave"><i></i><i></i><i></i><i></i><i></i></div>
-        </div>
-        <div class="transcript" id="transcript" aria-live="polite"><span>You</span><p></p></div>
-        <div class="reply" id="reply" aria-live="polite"><span>Buddy</span><p></p></div>
+        <canvas class="voice-ring" id="voice-ring" aria-hidden="true"></canvas>
+        <div class="sr-only" id="transcript" aria-live="polite"><p></p></div>
+        <div class="sr-only" id="reply" aria-live="polite"><p></p></div>
         <div class="screen-rim" aria-hidden="true"></div>
       </section>
       <section class="notes">
